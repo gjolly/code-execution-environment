@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -18,7 +19,12 @@ import (
 
 var execMu sync.Mutex
 
-const workspace = "/workspace"
+const (
+	workspace  = "/workspace"
+	socketPath = "/run/execsock/exec.sock"
+	// 512 MB /workspace tmpfs after base64 (~683 MB) + JSON envelope.
+	maxRequestBytes = 700 << 20
+)
 
 func resolveP(p string) string {
 	if filepath.IsAbs(p) {
@@ -155,8 +161,14 @@ func handleRead(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleWrite(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 	var req writeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			respondError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("payload exceeds %d bytes", maxErr.Limit))
+			return
+		}
 		respondError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
@@ -199,8 +211,23 @@ func main() {
 	mux.HandleFunc("/exec", handleExec)
 	mux.HandleFunc("/read", handleRead)
 	mux.HandleFunc("/write", handleWrite)
+	mux.HandleFunc("/snapshot", handleSnapshot)
+	// /restore is reachable on this internal socket. The api-server proxy
+	// gates it behind a startup-only flag.
+	mux.HandleFunc("/restore", handleRestore)
 	mux.HandleFunc("/health", healthHandler)
 
-	log.Println("executor listening on :9000")
-	log.Fatal(http.ListenAndServe(":9000", mux))
+	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
+		log.Fatalf("removing stale socket: %v", err)
+	}
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		log.Fatalf("listen unix %s: %v", socketPath, err)
+	}
+	if err := os.Chmod(socketPath, 0o660); err != nil {
+		log.Fatalf("chmod socket: %v", err)
+	}
+
+	log.Printf("executor listening on unix:%s", socketPath)
+	log.Fatal(http.Serve(listener, mux))
 }
