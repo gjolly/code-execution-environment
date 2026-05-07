@@ -1,9 +1,6 @@
 package main
 
-// /snapshot and /restore handle the workspace tar in plaintext. Encryption
-// happens upstream (the orchestrator hands the plaintext tar to tinfoil-buckets,
-// which encrypts under the user-supplied symmetric key). The executor never
-// sees keys or ciphertext.
+// /snapshot and /restore handle the workspace tar in plaintext. Encryption happens upstream.
 
 import (
 	"archive/tar"
@@ -13,43 +10,40 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 )
 
-// matches /workspace tmpfs ceiling.
-const maxFileBytes = 512 << 20
-
-// snapshotResponse is the plaintext tar of /workspace, base64-encoded.
+// snapshotResponse exists for test decoding; handleSnapshot frames JSON manually.
 type snapshotResponse struct {
 	Tar string `json:"tar"`
 }
 
-// tarWorkspace tars the workspace directory and returns the bytes.
-// Includes regular files and directories. Symlinks/devices/etc are skipped.
-func tarWorkspace(root string) ([]byte, error) {
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
+// snapshotTrailer is set to "ok" only on the success path of /snapshot.
+const snapshotTrailer = "X-Snapshot-Status"
 
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+// Whitelist tar: regular files and directories only
+func tarWorkspace(root *os.Root, w io.Writer) error {
+	tw := tar.NewWriter(w)
+
+	err := fs.WalkDir(root.FS(), ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		// Skip the root itself.
-		if path == root {
+		if path == "." {
 			return nil
 		}
 
-		rel, err := filepath.Rel(root, path)
+		info, err := d.Info()
 		if err != nil {
 			return err
 		}
 
 		mode := info.Mode()
 		if !mode.IsRegular() && !mode.IsDir() {
-			// Skip symlinks/devices/sockets — keeps things simple and
-			// matches "we don't allow long-running processes" in spirit.
 			return nil
 		}
 
@@ -57,7 +51,7 @@ func tarWorkspace(root string) ([]byte, error) {
 		if err != nil {
 			return err
 		}
-		hdr.Name = rel
+		hdr.Name = path
 		if mode.IsDir() {
 			hdr.Name += "/"
 		}
@@ -66,7 +60,7 @@ func tarWorkspace(root string) ([]byte, error) {
 		}
 
 		if mode.IsRegular() {
-			f, err := os.Open(path)
+			f, err := root.Open(path)
 			if err != nil {
 				return err
 			}
@@ -79,22 +73,15 @@ func tarWorkspace(root string) ([]byte, error) {
 		return nil
 	})
 	if err != nil {
-		return nil, err
-	}
-	if err := tw.Close(); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-// untarInto extracts a tar archive into root. Used by /restore.
-// Refuses any entry whose resolved path escapes root (path traversal guard).
-func untarInto(root string, data []byte) error {
-	tr := tar.NewReader(bytes.NewReader(data))
-	absRoot, err := filepath.Abs(root)
-	if err != nil {
 		return err
 	}
+	return tw.Close()
+}
+
+// Whitelist untar: TypeDir + TypeReg only. Path escape is caught by
+// *os.Root (openat2 RESOLVE_BENEATH); size by the /workspace tmpfs cap.
+func untarInto(root *os.Root, data []byte) error {
+	tr := tar.NewReader(bytes.NewReader(data))
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -103,31 +90,17 @@ func untarInto(root string, data []byte) error {
 		if err != nil {
 			return err
 		}
-		// Sanitize: reject absolute paths and ".." traversal.
-		clean := filepath.Clean(hdr.Name)
-		if filepath.IsAbs(clean) || clean == ".." {
-			return fmt.Errorf("invalid tar entry path: %s", hdr.Name)
-		}
-		target := filepath.Join(absRoot, clean)
-		// Ensure target is still inside root.
-		rel, err := filepath.Rel(absRoot, target)
-		if err != nil || rel == ".." || len(rel) >= 3 && rel[:3] == ".."+string(filepath.Separator) {
-			return fmt.Errorf("tar entry escapes root: %s", hdr.Name)
-		}
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0o755); err != nil {
+			if err := root.MkdirAll(hdr.Name, 0o755); err != nil {
 				return err
 			}
 		case tar.TypeReg:
-			if hdr.Size > maxFileBytes {
-				return fmt.Errorf("tar entry %q exceeds %d bytes", hdr.Name, maxFileBytes)
-			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := root.MkdirAll(filepath.Dir(hdr.Name), 0o755); err != nil {
 				return err
 			}
-			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+			f, err := root.OpenFile(hdr.Name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 			if err != nil {
 				return err
 			}
@@ -136,30 +109,37 @@ func untarInto(root string, data []byte) error {
 				return err
 			}
 			f.Close()
-		default:
-			// Skip symlinks/devices/etc.
 		}
 	}
 	return nil
 }
 
+// Streams tar → base64 → response writer so peak RAM is independent
+// of workspace size. Status is committed before tar runs; mid-stream
+// errors only log and truncate. Manual JSON framing is safe because
+// base64.StdEncoding produces no JSON-escapable bytes.
+//
+// The snapshotTrailer is declared up-front and only set to "ok" once done
 func handleSnapshot(w http.ResponseWriter, r *http.Request) {
-	tarBytes, err := tarWorkspace(workspace)
-	if err != nil {
-		respondError(w, http.StatusInternalServerError, fmt.Sprintf("tar: %v", err))
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Trailer", snapshotTrailer)
+	w.WriteHeader(http.StatusOK)
+	io.WriteString(w, `{"tar":"`)
+	enc := base64.NewEncoder(base64.StdEncoding, w)
+	if err := tarWorkspace(workspaceRoot, enc); err != nil {
+		log.Printf("snapshot: %v", err)
 		return
 	}
-	respondJSON(w, http.StatusOK, snapshotResponse{
-		Tar: base64.StdEncoding.EncodeToString(tarBytes),
-	})
+	if err := enc.Close(); err != nil {
+		log.Printf("snapshot: base64 close: %v", err)
+		return
+	}
+	io.WriteString(w, `"}`)
+	w.Header().Set(snapshotTrailer, "ok")
 }
 
-// --- restore (internal-only, gated) -----------------------------------------
-
 type restoreRequest struct {
-	// Tar is the raw plaintext tar bytes, base64-encoded. The orchestrator
-	// fetched the snapshot from tinfoil-buckets (which decrypted it under the
-	// user-supplied key) before calling this.
+	// Tar is the raw plaintext tar bytes, base64-encoded.
 	Tar string `json:"tar"`
 }
 
@@ -188,7 +168,7 @@ func handleRestore(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, "tar is not valid base64")
 		return
 	}
-	if err := untarInto(workspace, data); err != nil {
+	if err := untarInto(workspaceRoot, data); err != nil {
 		respondError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

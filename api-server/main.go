@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"sync"
@@ -18,12 +20,9 @@ const (
 	executorURL = "http://executor"
 )
 
-// 120s budget covers /snapshot and /restore bulk transfers at the
-// /workspace tmpfs ceiling (512 MB plaintext → ~683 MB after base64
-// in the JSON body). /exec, /read, /write all return in well under a
-// second, and the upstream caller (orchestrator) already enforces a
-// 35s tool-call cap — proxyHandler propagates that cap via r.Context()
-// so this 120s ceiling is just a defense-in-depth backstop.
+// 120s budget to cover  /snapshot and /restore bulk transfers at the
+// /workspace tmpfs ceiling (512 MB plaintext → ~683 MB after base64 in the JSON body).
+// It's the responsibility of the upstream caller to enforce a ceiling on eg tool calls
 var executorClient = &http.Client{
 	Timeout: 120 * time.Second,
 	Transport: &http.Transport{
@@ -33,43 +32,49 @@ var executorClient = &http.Client{
 	},
 }
 
-// Public, always-on paths.
-var allowedPaths = map[string]bool{
-	"/exec":     true,
-	"/read":     true,
-	"/write":    true,
-	"/snapshot": true,
+// lifecycle is the container's session state.
+//
+//   - warm: no user traffic yet. /restore is allowed (idempotent retry);
+//     /exec, /read, /write, /snapshot transition to active.
+//   - active: user traffic has begun. /restore returns 410; everything
+//     else proceeds. A successful /snapshot transitions to killed.
+//   - killed: snapshot taken, session over. Every call returns 410.
+type lifecycle int
+
+const (
+	lifecycleWarm lifecycle = iota
+	lifecycleActive
+	lifecycleKilled
+)
+
+func (l lifecycle) String() string {
+	switch l {
+	case lifecycleWarm:
+		return "warm"
+	case lifecycleActive:
+		return "active"
+	case lifecycleKilled:
+		return "killed"
+	}
+	return "unknown"
 }
 
-// gate is the container's per-lifetime access policy. Two one-way bits,
-// both set lazily by incoming requests:
-//
-//   - token: empty until the first valid X-Code-Execution-Access-Token
-//     claims it; afterwards every call must match or get 403.
-//   - restoreOpen: /restore is allowed only while true. Flips false on
-//     the first non-/restore call — once user traffic has begun,
-//     /restore is dead for the container's lifetime.
-//
-// They live behind one mutex because every gated call touches both.
-// Defense-in-depth pairing: token blocks an attacker hitting a fresh
-// warm-pool container before the orchestrator does; restoreOpen blocks
-// an attacker injecting a tar after user traffic starts even if the
-// token leaks.
+// gate is the container's per-lifetime access policy
 type gate struct {
-	mu          sync.Mutex
-	token       string
-	restoreOpen bool
+	mu    sync.Mutex
+	token string
+	state lifecycle
 }
 
-var g = &gate{restoreOpen: true}
+var g = &gate{state: lifecycleWarm}
 
 // check applies the gate to a single request. ok=false means the caller
 // should short-circuit with the returned status and error message.
 //
-// Status mapping (the orchestrator distinguishes these):
-//   - 401 missing token   → caller bug, no container teardown
-//   - 403 token mismatch  → poisoned container, orchestrator tears down
-//   - 410 restore closed  → /restore after user traffic began
+// Status
+//   - 401 missing token
+//   - 403 token mismatch
+//   - 410 lifecycle disallows this call
 func (g *gate) check(path, tok string) (status int, msg string, ok bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -78,40 +83,53 @@ func (g *gate) check(path, tok string) (status int, msg string, ok bool) {
 	}
 	if g.token == "" {
 		g.token = tok
-	} else if g.token != tok {
+	} else if subtle.ConstantTimeCompare([]byte(g.token), []byte(tok)) != 1 {
 		return http.StatusForbidden, "access token mismatch", false
 	}
-	if path == "/restore" {
-		if !g.restoreOpen {
+
+	switch g.state {
+	case lifecycleKilled:
+		return http.StatusGone, "container session ended", false
+	case lifecycleActive:
+		if path == "/restore" {
 			return http.StatusGone, "restore window closed", false
 		}
-		// Multiple /restore attempts are fine (transient retries). The
-		// window only closes on a non-restore call.
-	} else {
-		g.restoreOpen = false
+	case lifecycleWarm:
+		// /restore is idempotent and stays in warm
+		if path != "/restore" {
+			g.state = lifecycleActive
+		}
 	}
 	return 0, "", true
 }
 
+// markKilled is called after a successful /snapshot transfer to close
+// the container for any further calls.
+func (g *gate) markKilled() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.state = lifecycleKilled
+}
+
+// writeJSONError responds with a JSON {"error": "<msg>"} body and the
+// given status. Uses %q so quotes/control characters in msg are escaped.
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	fmt.Fprintf(w, `{"error":%q}`, msg)
+}
+
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
 	path := r.URL.Path
 
-	// Reject unknown paths before the gate so they can't claim the token.
-	if path != "/restore" && !allowedPaths[path] {
-		http.NotFound(w, r)
-		return
-	}
-
 	if status, msg, ok := g.check(path, r.Header.Get("X-Code-Execution-Access-Token")); !ok {
 		log.Printf("api-server: gating %s — %s (%d)", path, msg, status)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		fmt.Fprintf(w, `{"error":%q}`, msg)
+		writeJSONError(w, status, msg)
 		return
 	}
 
@@ -121,30 +139,70 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	// going to be discarded.
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, executorURL+path, r.Body)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, `{"error":"%s"}`, err.Error())
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := executorClient.Do(req)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadGateway)
-		fmt.Fprintf(w, `{"error":"executor unavailable: %s"}`, err.Error())
+		writeJSONError(w, http.StatusBadGateway, "executor unavailable: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
 
+	// Forward any trailers the executor announced so the orchestrator
+	// sees them too.
+	if announced := resp.Header.Get("Trailer"); announced != "" {
+		w.Header().Set("Trailer", announced)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	_, copyErr := io.Copy(w, resp.Body)
+
+	// resp.Trailer is populated only after the body has been fully read.
+	maps.Copy(w.Header(), resp.Trailer)
+
+	// A successful /snapshot is the terminal event in the container's
+	// lifecycle. The executor signals clean completion via the snapshot
+	// trailer
+	if path == "/snapshot" &&
+		resp.StatusCode == http.StatusOK &&
+		copyErr == nil &&
+		resp.Trailer.Get(snapshotTrailer) == "ok" {
+		g.markKilled()
+	}
 }
 
+// snapshotTrailer must match executor's snapshot trailer name. Kept as a
+// string here so api-server doesn't have to import the executor package.
+const snapshotTrailer = "X-Snapshot-Status"
+
+// healthHandler reports api-server health AND executor health. Returns
+// 200 only when both are reachable; otherwise 503
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"status":"ok"}`))
+	if !executorHealthy(r.Context()) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// executorHealthy probes the executor's /health over the unix socket
+func executorHealthy(ctx context.Context) bool {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, executorURL+"/health", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := executorClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }
 
 func main() {
@@ -154,6 +212,7 @@ func main() {
 	mux.HandleFunc("/write", proxyHandler)
 	mux.HandleFunc("/snapshot", proxyHandler)
 	mux.HandleFunc("/restore", proxyHandler)
+
 	mux.HandleFunc("/health", healthHandler)
 
 	log.Println("api server listening on :8000")
