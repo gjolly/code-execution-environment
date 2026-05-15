@@ -5,7 +5,7 @@ memory: 8192
 
 containers:
   - name: "api-server"
-    image: "ghcr.io/tinfoilsh/code-execution-environment/api-server@sha256:b5d83fc315f4fab62ff26aee7eedd5c9f05f03b801b2b740ed4ea85557ca8771" # v0.0.13
+    image: "ghcr.io/tinfoilsh/code-execution-environment/api-server@sha256:290f691c1a76aca63601c4062b5993ef73bbc74d1c8dc33456943b495b31c01d" # v0.0.16
     user: "1000:1000"
     read_only: true
     cap_drop: ["ALL"]
@@ -17,13 +17,17 @@ containers:
       - "execsock:/run/execsock"
 
   - name: "executor"
-    image: "ghcr.io/tinfoilsh/code-execution-environment/executor@sha256:ca4863cb2ce74dcbc9473dbecc6cf5927e6626a94d3c4590ccaacb79db6759c2" # v0.0.13
+    image: "ghcr.io/tinfoilsh/code-execution-environment/executor@sha256:187b36caf33002d8dee74cc81560719d69c84a8449c949468ed6b9afd3ef5dbd" # v0.0.16
     user: "1000:1000"
     read_only: true
     tmpfs:
       /workspace: "size=512m,mode=1777"
       /tmp: "size=3g,mode=1777"
+      # /user-uploads is owned by uid 1000 (the executor)
+      /user-uploads: "size=256m,mode=755,uid=1000,gid=1000"
     cap_drop: ["ALL"]
+    # SETUID/SETGID let the executor spawn bash as uid 1001 to enforce ro /user-uploads
+    cap_add: ["SETUID", "SETGID"]
     security_opt:
       - "no-new-privileges:true"
     memory: "6g" # Could be smaller but no need
@@ -40,4 +44,6 @@ shim:
     - /write
     - /snapshot
     - /restore
+    - /sync-uploads/manifest
+    - /sync-uploads/blobs
     - /health
