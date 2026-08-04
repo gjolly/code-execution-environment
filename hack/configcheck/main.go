@@ -32,6 +32,10 @@ const sandboxContainer = "executor"
 // recorderContainer is the one that must be the sole egress path.
 const recorderContainer = "api-server"
 
+// recorderUser is the uid:gid the recorder must run as. See the check itself
+// for why it is neither root-by-default nor an unprivileged uid.
+const recorderUser = "0:1000"
+
 type config struct {
 	Networks   map[string]*networkSpec `yaml:"networks"`
 	Containers []container             `yaml:"containers"`
@@ -164,13 +168,20 @@ func check(cfg *config) []string {
 			"%s has no egress-capable network; nothing can reach the internet", recorderContainer))
 	}
 
-	// uid 0 is required to read the root-owned 0600 TLS key. If someone
-	// re-adds `user:` the checkpoint signer fails at startup, which is a
-	// confusing way to discover this.
-	if recorder.User != "" {
+	// Both halves of this are load-bearing, and each fails at a different
+	// point in startup. uid 0 owns the root-owned 0600 TLS key, which is how
+	// the checkpoint signer is allowed to read it — cap_drop: ["ALL"] means
+	// there is no CAP_DAC_OVERRIDE to fall back on. gid 1000 is the group of
+	// the executor's 0660 socket, and connect(2) wants write permission on
+	// it, so without the gid every session init returns EACCES. Widening the
+	// socket instead is not an option: it is visible to the uid 1001 that
+	// /exec runs user code as, which would put the executor's control API in
+	// reach of the sandbox with no api-server in the path to record it.
+	if recorder.User != recorderUser {
 		problems = append(problems, fmt.Sprintf(
-			"%s sets user: %q, but uid 0 is required to read the bind-mounted TLS key",
-			recorderContainer, recorder.User))
+			"%s sets user: %q, want %q — uid 0 to read the bind-mounted TLS key, "+
+				"gid 1000 to connect to the executor's 0660 socket",
+			recorderContainer, recorder.User, recorderUser))
 	}
 
 	if !hasTLSMount(recorder.Volumes) {
