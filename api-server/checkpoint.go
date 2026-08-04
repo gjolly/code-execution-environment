@@ -41,7 +41,7 @@ import (
 )
 
 const (
-	tlsKeyPath = "/tinfoil/tls/key.pem"
+	tlsKeyPath = "/run/tinfoil/tls/key.pem"
 
 	// checkpointAlg is recorded in the served document so a verifier never
 	// has to infer it from the key.
