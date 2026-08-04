@@ -8,16 +8,46 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 )
 
+func keyFPOrEmpty(s *Signer) string {
+	if s == nil {
+		return ""
+	}
+	return s.KeyFP()
+}
+
 type auditAPI struct {
-	audit  *AuditLog
-	signer *Signer
-	proxy  *EgressProxy
-	ca     *CA
+	audit *AuditLog
+	proxy *EgressProxy
+	ca    *CA
+
+	// signer arrives asynchronously: the TLS key is written by cvmimage's boot
+	// and mounted in, so it may not exist the instant we start.
+	signer atomic.Pointer[Signer]
 
 	// policy is the composed session policy; nil until /audit/session lands.
 	policy *EffectivePolicy
+}
+
+func (a *auditAPI) setSigner(s *Signer) {
+	a.signer.Store(s)
+	signerReady.Store(true)
+}
+
+// requireSigner returns the signer, or writes a 503 explaining why the
+// transcript cannot currently be attributed to this CVM.
+func (a *auditAPI) requireSigner(w http.ResponseWriter) (*Signer, bool) {
+	if s := a.signer.Load(); s != nil {
+		return s, true
+	}
+	msg := "checkpoint signer not ready"
+	if e := signerErr.Load(); e != nil {
+		msg = "checkpoint signer unavailable: " + (*e).Error()
+	}
+	writeJSONError(w, http.StatusServiceUnavailable, msg)
+	return nil, false
 }
 
 // headResponse is what a verifier needs to drive the attestation binding. It
@@ -36,6 +66,10 @@ type headResponse struct {
 }
 
 func (a *auditAPI) handleHead(w http.ResponseWriter, r *http.Request) {
+	signer, ok := a.requireSigner(w)
+	if !ok {
+		return
+	}
 	head, seq := a.audit.Head()
 
 	policyHash := ""
@@ -73,7 +107,7 @@ func (a *auditAPI) handleHead(w http.ResponseWriter, r *http.Request) {
 		resp.Nonce = nonce
 	}
 
-	signed, err := a.signer.Sign(a.audit.SegmentID(), seq, head, policyHash)
+	signed, err := signer.Sign(a.audit.SegmentID(), seq, head, policyHash)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "signing checkpoint: "+err.Error())
 		return
@@ -128,7 +162,7 @@ func (a *auditAPI) handleSession(w http.ResponseWriter, r *http.Request) {
 		SegmentID:    a.audit.SegmentID(),
 		Policy:       eff,
 		MITMCASHA256: a.ca.Fingerprint(),
-		TLSKeyFP:     a.signer.KeyFP(),
+		TLSKeyFP:     keyFPOrEmpty(a.signer.Load()),
 		Retention:    "hash-and-size",
 	}); err != nil {
 		writeJSONError(w, http.StatusInsufficientStorage, err.Error())

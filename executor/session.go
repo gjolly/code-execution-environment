@@ -16,7 +16,9 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -27,9 +29,40 @@ import (
 const caPath = "/tmp/tinfoil-egress-ca.pem"
 
 type sessionInitRequest struct {
-	ProxyURL string `json:"proxy_url"`
-	CAPEM    string `json:"ca_pem"`
-	NoProxy  string `json:"no_proxy"`
+	// ProxyCandidates are the api-server's addresses as CIDRs. It cannot pick
+	// for us: it sits on three bridges and cvmimage attaches the egress-capable
+	// one first, so its "first" address is most likely one we must not use. We
+	// have exactly one interface, so we match on subnet.
+	ProxyCandidates []string `json:"proxy_candidates"`
+	ProxyPort       string   `json:"proxy_port"`
+	CAPEM           string   `json:"ca_pem"`
+	NoProxy         string   `json:"no_proxy"`
+}
+
+// selectProxy returns the candidate that shares a subnet with one of our own
+// interfaces.
+func selectProxy(candidates []string, port string) (string, error) {
+	local, err := net.InterfaceAddrs()
+	if err != nil {
+		return "", fmt.Errorf("listing interfaces: %w", err)
+	}
+
+	for _, c := range candidates {
+		ip, ipnet, err := net.ParseCIDR(c)
+		if err != nil {
+			continue
+		}
+		for _, a := range local {
+			mine, ok := a.(*net.IPNet)
+			if !ok || mine.IP.To4() == nil || mine.IP.IsLoopback() {
+				continue
+			}
+			if ipnet.Contains(mine.IP) {
+				return "http://" + net.JoinHostPort(ip.String(), port), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no candidate in %v shares a subnet with this container", candidates)
 }
 
 var (
@@ -44,16 +77,26 @@ func handleSessionInit(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-	if req.ProxyURL == "" {
-		respondError(w, http.StatusBadRequest, "proxy_url is required")
+	if len(req.ProxyCandidates) == 0 {
+		respondError(w, http.StatusBadRequest, "proxy_candidates is required")
+		return
+	}
+	if req.ProxyPort == "" {
+		respondError(w, http.StatusBadRequest, "proxy_port is required")
+		return
+	}
+
+	proxy, err := selectProxy(req.ProxyCandidates, req.ProxyPort)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	env := []string{
-		"HTTP_PROXY=" + req.ProxyURL,
-		"HTTPS_PROXY=" + req.ProxyURL,
-		"http_proxy=" + req.ProxyURL,
-		"https_proxy=" + req.ProxyURL,
+		"HTTP_PROXY=" + proxy,
+		"HTTPS_PROXY=" + proxy,
+		"http_proxy=" + proxy,
+		"https_proxy=" + proxy,
 		"NO_PROXY=" + req.NoProxy,
 		"no_proxy=" + req.NoProxy,
 		// Node's built-in fetch ignores the proxy variables unless told to.
@@ -81,7 +124,7 @@ func handleSessionInit(w http.ResponseWriter, r *http.Request) {
 	sessionSet = true
 	sessionMu.Unlock()
 
-	log.Printf("executor: session init applied, proxy=%s", req.ProxyURL)
+	log.Printf("executor: session init applied, proxy=%s", proxy)
 	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 

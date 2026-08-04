@@ -96,20 +96,29 @@ func LoadSigner(timeout time.Duration) (*Signer, error) {
 			return s, nil
 		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("waiting for %s: %w", tlsKeyPath, err)
+			return nil, fmt.Errorf("waiting for %s: %w", keyPath(), err)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 }
 
+// keyPath is tlsKeyPath in the CVM. TLS_KEY_PATH overrides it for local dev,
+// where the private ramdisk does not exist.
+func keyPath() string {
+	if p := os.Getenv("TLS_KEY_PATH"); p != "" {
+		return p
+	}
+	return tlsKeyPath
+}
+
 func loadSignerOnce() (*Signer, error) {
-	pemBytes, err := os.ReadFile(tlsKeyPath)
+	pemBytes, err := os.ReadFile(keyPath())
 	if err != nil {
 		return nil, err
 	}
 	block, _ := pem.Decode(pemBytes)
 	if block == nil {
-		return nil, fmt.Errorf("no PEM block in %s", tlsKeyPath)
+		return nil, fmt.Errorf("no PEM block in %s", keyPath())
 	}
 
 	var key *ecdsa.PrivateKey

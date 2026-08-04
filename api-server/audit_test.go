@@ -314,3 +314,38 @@ func mustCA(t *testing.T) *CA {
 	}
 	return ca
 }
+
+// The transcript and the policy that governs it must not be readable or
+// writable without the container auth token.
+func TestAuditSurface_RequiresAuthToken(t *testing.T) {
+	defer withFakeExecutor(t, func(w http.ResponseWriter, r *http.Request) {})()
+
+	handler := requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("SECRET TRANSCRIPT"))
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/audit/log", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status %d, want 401", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "SECRET") {
+		t.Error("unauthenticated request reached the transcript")
+	}
+
+	// With the token it passes, and does NOT advance the lifecycle — /restore
+	// must still be open afterwards.
+	req = httptest.NewRequest(http.MethodGet, "/audit/log", nil)
+	req.Header.Set(authTokenHeader, "tok")
+	w = httptest.NewRecorder()
+	handler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200 with a valid token", w.Code)
+	}
+	if g.state != lifecycleWarm {
+		t.Errorf("state = %s, want warm — /audit/* must not close the restore window", g.state)
+	}
+}

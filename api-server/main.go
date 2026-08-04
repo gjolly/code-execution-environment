@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -42,7 +43,8 @@ var executorClient = &http.Client{
 	Timeout: 120 * time.Second,
 	Transport: &http.Transport{
 		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-			return net.Dial("unix", executorSocket)
+			// EXECUTOR_SOCKET overrides the path for local dev.
+			return net.Dial("unix", envOr("EXECUTOR_SOCKET", executorSocket))
 		},
 	},
 }
@@ -162,6 +164,23 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 // auditRecorder is set at startup; nil only in tests that exercise the gate
 // alone.
 var auditRecorder *AuditLog
+
+// requireAuth applies the container auth-token lock to the /audit/* surface.
+//
+// Deliberately auth-only, with no lifecycle check. /audit/session has to run
+// before /restore, and flipping the gate warm→active would close the restore
+// window; /audit/log has to stay readable after /snapshot has moved the gate to
+// killed, which is exactly when the orchestrator collects the transcript.
+func requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if status, msg, ok := g.checkAuth(r.Header.Get(authTokenHeader)); !ok {
+			log.Printf("api-server: gating %s — %s (%d)", r.URL.Path, msg, status)
+			writeJSONError(w, status, msg)
+			return
+		}
+		next(w, r)
+	}
+}
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -373,12 +392,31 @@ const snapshotTrailer = "X-Snapshot-Status"
 // healthHandler reports api-server health AND executor health. Returns
 // 200 only when both are reachable; otherwise 503
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	if !executorHealthy(r.Context()) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		return
+	execOK := executorHealthy(r.Context())
+
+	signer := "ready"
+	if e := signerErr.Load(); e != nil {
+		signer = "failed: " + (*e).Error()
+	} else if !signerReady.Load() {
+		signer = "loading"
 	}
-	w.WriteHeader(http.StatusOK)
+
+	w.Header().Set("Content-Type", "application/json")
+	if !execOK {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
+	// Status code keeps its original meaning (executor reachability); the body
+	// carries the detail that would otherwise only exist in container logs.
+	fmt.Fprintf(w, `{"executor":%q,"checkpoint_signer":%q}`,
+		map[bool]string{true: "ok", false: "unreachable"}[execOK], signer)
 }
+
+var (
+	signerErr   atomic.Pointer[error]
+	signerReady atomic.Bool
+)
 
 // executorHealthy probes the executor's /health over the unix socket
 func executorHealthy(ctx context.Context) bool {
@@ -404,11 +442,12 @@ func executorHealthy(ctx context.Context) bool {
 // not knowable at image-build time, and with no resolver in the sandbox there
 // is nothing to look it up with. Pushing over the existing unix socket keeps
 // the direction of trust intact — api-server to executor, never the reverse.
-func pushSessionInit(ctx context.Context, proxyURL, caPEM string) {
-	payload, err := json.Marshal(map[string]string{
-		"proxy_url": proxyURL,
-		"ca_pem":    caPEM,
-		"no_proxy":  "localhost,127.0.0.1",
+func pushSessionInit(ctx context.Context, candidates []string, port, caPEM string) {
+	payload, err := json.Marshal(map[string]any{
+		"proxy_candidates": candidates,
+		"proxy_port":       port,
+		"ca_pem":           caPEM,
+		"no_proxy":         "localhost,127.0.0.1",
 	})
 	if err != nil {
 		log.Printf("api-server: marshaling session init: %v", err)
@@ -428,7 +467,7 @@ func pushSessionInit(ctx context.Context, proxyURL, caPEM string) {
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				log.Printf("api-server: executor session init ok (proxy=%s)", proxyURL)
+				log.Printf("api-server: executor session init ok (candidates=%v)", candidates)
 				return
 			}
 			err = fmt.Errorf("status %d", resp.StatusCode)
@@ -444,17 +483,26 @@ func pushSessionInit(ctx context.Context, proxyURL, caPEM string) {
 	}
 }
 
-// sandboxIP finds the address the executor should send proxy traffic to: our
-// IPv4 on some bridge other than the private shim hop.
-func sandboxIP() (string, error) {
+// proxyCandidates lists every address the proxy might be reachable at, as
+// CIDRs so the executor can tell which one is on its own network.
+//
+// We cannot pick for it. The api-server sits on three bridges — egress-net,
+// sandbox-net and shim-net — and cvmimage attaches the egress-capable one
+// first (cmd/boot/containers.go attachOrder), so "the first non-shim address"
+// is most likely the egress address: one the executor cannot reach and must
+// not use. Docker assigns these subnets dynamically, so neither side can
+// hardcode them. The executor has exactly one interface, so it can match.
+func proxyCandidates() ([]string, error) {
 	_, shimNet, err := net.ParseCIDR(shimNetCIDR)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
+
+	var out []string
 	for _, a := range addrs {
 		ipnet, ok := a.(*net.IPNet)
 		if !ok {
@@ -464,9 +512,13 @@ func sandboxIP() (string, error) {
 		if ip == nil || ip.IsLoopback() || shimNet.Contains(ip) {
 			continue
 		}
-		return ip.String(), nil
+		ones, _ := ipnet.Mask.Size()
+		out = append(out, fmt.Sprintf("%s/%d", ip.String(), ones))
 	}
-	return "", fmt.Errorf("no sandbox-facing IPv4 address found")
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no sandbox-facing IPv4 address found")
+	}
+	return out, nil
 }
 
 func envOr(key, def string) string {
@@ -480,14 +532,6 @@ func main() {
 	audit := NewAuditLog()
 	auditRecorder = audit
 
-	// Blocks until cvmimage's boot has written the key; see checkpoint.go for
-	// why this container holds it at all.
-	signer, err := LoadSigner(3 * time.Minute)
-	if err != nil {
-		log.Fatalf("api-server: %v", err)
-	}
-	signer.logReady()
-
 	ca, err := NewCA()
 	if err != nil {
 		log.Fatalf("api-server: %v", err)
@@ -495,7 +539,26 @@ func main() {
 	log.Printf("api-server: egress CA ready, sha256=%s", ca.Fingerprint())
 
 	proxy := NewEgressProxy(audit, ca)
-	api := &auditAPI{audit: audit, signer: signer, proxy: proxy, ca: ca}
+	api := &auditAPI{audit: audit, proxy: proxy, ca: ca}
+
+	// Load the signer in the background rather than blocking startup on it.
+	// cvmimage writes the TLS key during boot, so a short wait is normal — but
+	// if the mount is missing or unreadable, dying here would take the whole
+	// api-server with it and the only symptom anywhere would be a 502 from the
+	// shim. Coming up regardless means /health can say what is wrong, and only
+	// the endpoints that actually need the key fail.
+	go func() {
+		signer, err := LoadSigner(3 * time.Minute)
+		if err != nil {
+			signerErr.Store(&err)
+			log.Printf("api-server: NO CHECKPOINT SIGNER: %v", err)
+			log.Printf("api-server: transcripts cannot be attributed to this CVM; "+
+				"check that %s is bind-mounted and readable (uid 0 required)", keyPath())
+			return
+		}
+		signer.logReady()
+		api.setSigner(signer)
+	}()
 
 	// Control mux: tool calls plus the audit surface. Bound to the shim-net
 	// address only, so nothing on the sandbox network can reach it.
@@ -508,10 +571,10 @@ func main() {
 	control.HandleFunc("/sync-uploads/manifest", proxyHandler)
 	control.HandleFunc("/sync-uploads/blobs", proxyHandler)
 	control.HandleFunc("/health", healthHandler)
-	control.HandleFunc("/audit/head", api.handleHead)
-	control.HandleFunc("/audit/log", api.handleLog)
-	control.HandleFunc("/audit/session", api.handleSession)
-	control.HandleFunc("/audit/resume", api.handleResume)
+	control.HandleFunc("/audit/head", requireAuth(api.handleHead))
+	control.HandleFunc("/audit/log", requireAuth(api.handleLog))
+	control.HandleFunc("/audit/session", requireAuth(api.handleSession))
+	control.HandleFunc("/audit/resume", requireAuth(api.handleResume))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -519,10 +582,10 @@ func main() {
 	// Tell the executor where to send its traffic. Best-effort discovery: in
 	// local dev without the sandbox bridge, the proxy is still served, it just
 	// cannot be advertised.
-	if ip, err := sandboxIP(); err != nil {
+	if candidates, err := proxyCandidates(); err != nil {
 		log.Printf("api-server: %v; executor will not be given a proxy", err)
 	} else {
-		go pushSessionInit(ctx, "http://"+net.JoinHostPort(ip, proxyPort), ca.CertPEM())
+		go pushSessionInit(ctx, candidates, proxyPort, ca.CertPEM())
 	}
 
 	go func() {
