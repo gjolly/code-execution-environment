@@ -29,7 +29,7 @@ networks:
 
 containers:
   - name: "api-server"
-    image: "ghcr.io/gjolly/code-execution-environment/api-server@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
+    image: "ghcr.io/gjolly/code-execution-environment/api-server@sha256:e8a5e5ffae58468fd932b56386ad47365986c8d56484329a8e2e250dd640933f" # v1.0.6
     # uid 0 is required to read the root-owned 0600 TLS key mounted below
     # (bind mounts do not remap ownership); owning the file is what grants
     # the read, so no capability is involved. gid 1000 matches the group of
@@ -67,7 +67,7 @@ containers:
       - "/mnt/ramdisk/private/tls:/run/tinfoil/tls:ro"
 
   - name: "executor"
-    image: "ghcr.io/gjolly/code-execution-environment/executor@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
+    image: "ghcr.io/gjolly/code-execution-environment/executor@sha256:c8f7f0564af925fe77c3c360255e7dd11ce9dbbe91ed00aa65574ba74d66cf3f" # v1.0.6
     user: "1000:1000"
     read_only: true
     tmpfs:
