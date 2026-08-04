@@ -80,6 +80,62 @@ func TestDecide(t *testing.T) {
 	}
 }
 
+// AdmitHost is the CONNECT-time gate. It must be host-granular: a path-scoped
+// allow like "/simple/**" has to admit the host so interception can then enforce
+// the path per request. Regression test for HTTPS CONNECT returning 403.
+func TestAdmitHost(t *testing.T) {
+	eff, err := Compose(
+		[]string{"pypi.org", "api.example.com"},
+		&Policy{
+			Allow:      []string{"https://pypi.org/simple/**", "https://api.example.com/v1/**"},
+			Deny:       []string{"**/secret/**"}, // path-scoped: must NOT block CONNECT
+			TunnelOnly: []string{"api.example.com"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		host       string
+		wantAllow  bool
+		wantTunnel bool
+	}{
+		{"pypi.org", true, false},          // path-scoped allow still admits the host
+		{"api.example.com", true, true},    // tunnel-only host
+		{"evil.example.com", false, false}, // no allow rule matches the host
+	}
+	for _, tc := range tests {
+		allow, tunnel, rule := eff.AdmitHost(tc.host)
+		if allow != tc.wantAllow {
+			t.Errorf("AdmitHost(%q) allowed = %v, want %v (rule %s)", tc.host, allow, tc.wantAllow, rule)
+		}
+		if allow && tunnel != tc.wantTunnel {
+			t.Errorf("AdmitHost(%q) tunnel = %v, want %v", tc.host, tunnel, tc.wantTunnel)
+		}
+		if rule == "" {
+			t.Errorf("AdmitHost(%q): no rule recorded", tc.host)
+		}
+	}
+}
+
+// A whole-host deny blocks the CONNECT outright; a path-scoped deny does not.
+func TestAdmitHost_WholeHostDenyBlocks(t *testing.T) {
+	eff, err := Compose(
+		[]string{"pypi.org"},
+		&Policy{
+			Allow: []string{"https://pypi.org/simple/**"},
+			Deny:  []string{"https://pypi.org/**"}, // covers the whole host
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allow, _, rule := eff.AdmitHost("pypi.org"); allow {
+		t.Errorf("AdmitHost(pypi.org) allowed = true with a whole-host deny (rule %s)", rule)
+	}
+}
+
 func TestGlobMatch(t *testing.T) {
 	tests := []struct {
 		pattern, path string

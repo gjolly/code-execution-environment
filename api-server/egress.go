@@ -122,16 +122,36 @@ func (p *EgressProxy) gate(rawurl, method string) (pol *EffectivePolicy, tunnel 
 	return pol, tunnel, nil
 }
 
+// gateHost applies the fail-closed checks at CONNECT time, where only the host
+// is known. Admission is host-granular; path scoping is enforced later, per
+// request, by gate. Denials are recorded against the host, the finest URL we can
+// attribute them to here.
+func (p *EgressProxy) gateHost(host string) (tunnel bool, err error) {
+	if p.audit.Saturated() {
+		return false, errors.New("audit log saturated; egress refused")
+	}
+	pol := p.currentPolicy()
+	if pol == nil {
+		p.refuse("https://"+host+"/", http.MethodConnect, "no-policy", "no session policy installed")
+		return false, errors.New("no session policy installed")
+	}
+	allowed, tunnel, rule := pol.AdmitHost(host)
+	if !allowed {
+		p.refuse("https://"+host+"/", http.MethodConnect, rule, "denied by policy")
+		return false, fmt.Errorf("denied by policy (%s)", rule)
+	}
+	return tunnel, nil
+}
+
 // ---------- CONNECT ----------
 
 func (p *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	host, port := splitHostPort(r.Host, "443")
-	// At CONNECT time only the host is known. Interception re-checks each
-	// request against the full URL; tunnel-only hosts get host granularity
-	// and nothing more, which the audit entry states explicitly.
-	probe := "https://" + host + "/"
-
-	_, tunnel, err := p.gate(probe, http.MethodConnect)
+	// At CONNECT time only the host is known, so admission is host-granular.
+	// Interception re-checks each request against the full URL; tunnel-only
+	// hosts get host granularity and nothing more, which the audit entry states
+	// explicitly.
+	tunnel, err := p.gateHost(host)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
@@ -152,7 +172,7 @@ func (p *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	upstream, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), originDialTimeout)
 	if err != nil {
 		fmt.Fprintf(client, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
-		p.refuse(probe, http.MethodConnect, "upstream", "dial failed: "+err.Error())
+		p.refuse("https://"+host+"/", http.MethodConnect, "upstream", "dial failed: "+err.Error())
 		return
 	}
 	defer upstream.Close()

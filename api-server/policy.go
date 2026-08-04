@@ -143,6 +143,28 @@ func (e *EffectivePolicy) Decide(rawurl string) (allowed bool, tunnel bool, rule
 	return false, false, "default-deny"
 }
 
+// AdmitHost decides a CONNECT, where only the host is known. It is deliberately
+// host-granular: it admits if any allow rule could match the host, and refuses
+// only if a deny rule covers the *whole* host. Interception then re-checks every
+// actual request against the full URL in Decide, so path scoping is still
+// enforced for intercepted (non-tunnel) hosts; tunnel-only hosts get host
+// granularity and nothing more, which the audit entry states explicitly.
+func (e *EffectivePolicy) AdmitHost(host string) (allowed bool, tunnel bool, rule string) {
+	host = strings.ToLower(host)
+
+	for _, r := range e.Effective.Deny {
+		if hostWideRule(r, "https", host) {
+			return false, false, "deny:" + r
+		}
+	}
+	for _, r := range e.Effective.Allow {
+		if ruleHostMatches(r, "https", host) {
+			return true, e.isTunnelOnly(host), "allow:" + r
+		}
+	}
+	return false, false, "default-deny"
+}
+
 func (e *EffectivePolicy) isTunnelOnly(host string) bool {
 	for _, h := range e.Effective.TunnelOnly {
 		if hostMatches(strings.ToLower(h), host) {
@@ -202,26 +224,11 @@ func withinCeiling(ceiling []string, host string) bool {
 //
 // In path globs, * matches within one segment and ** matches across segments.
 func matchRule(rule, scheme, host, path string) bool {
-	rule = strings.TrimSpace(rule)
-	if rule == "**" || rule == "*" {
-		return true
-	}
-
-	ruleScheme := ""
-	rest := rule
-	if i := strings.Index(rule, "://"); i >= 0 {
-		ruleScheme = strings.ToLower(rule[:i])
-		rest = rule[i+3:]
-	}
+	ruleScheme, ruleHost, rulePath := splitRule(rule)
 	if ruleScheme != "" && ruleScheme != strings.ToLower(scheme) {
 		return false
 	}
-
-	ruleHost, rulePath := rest, ""
-	if i := strings.IndexByte(rest, '/'); i >= 0 {
-		ruleHost, rulePath = rest[:i], rest[i:]
-	}
-	if !hostMatches(strings.ToLower(ruleHost), host) {
+	if !hostMatches(ruleHost, host) {
 		return false
 	}
 	if rulePath == "" || rulePath == "/**" {
@@ -231,6 +238,48 @@ func matchRule(rule, scheme, host, path string) bool {
 		path = "/"
 	}
 	return globMatch(rulePath, path)
+}
+
+// splitRule parses a rule into its scheme, host and path glob. Scheme is "" when
+// the rule omits it; path is "" for a host-only rule. The bare wildcards "**"
+// and "*" parse as a host of that wildcard with an empty path, which hostMatches
+// treats as matching everything.
+func splitRule(rule string) (scheme, host, path string) {
+	rule = strings.TrimSpace(rule)
+	rest := rule
+	if i := strings.Index(rule, "://"); i >= 0 {
+		scheme = strings.ToLower(rule[:i])
+		rest = rule[i+3:]
+	}
+	host = rest
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		host, path = rest[:i], rest[i:]
+	}
+	return scheme, strings.ToLower(host), path
+}
+
+// ruleHostMatches is matchRule minus the path glob: it reports whether the rule
+// could apply to host at all. Used at CONNECT time, where no path is known.
+func ruleHostMatches(rule, scheme, host string) bool {
+	ruleScheme, ruleHost, _ := splitRule(rule)
+	if ruleScheme != "" && ruleScheme != strings.ToLower(scheme) {
+		return false
+	}
+	return hostMatches(ruleHost, host)
+}
+
+// hostWideRule reports whether the rule covers the entire host regardless of
+// path. A deny is host-wide only if its path is "" or "/**"; a path-scoped deny
+// like "**/secret/**" narrows specific paths and must not block a CONNECT.
+func hostWideRule(rule, scheme, host string) bool {
+	ruleScheme, ruleHost, rulePath := splitRule(rule)
+	if ruleScheme != "" && ruleScheme != strings.ToLower(scheme) {
+		return false
+	}
+	if !hostMatches(ruleHost, host) {
+		return false
+	}
+	return rulePath == "" || rulePath == "/**"
 }
 
 func hostMatches(ruleHost, host string) bool {
