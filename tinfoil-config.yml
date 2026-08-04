@@ -30,7 +30,7 @@ networks:
 
 containers:
   - name: "api-server"
-    image: "ghcr.io/gjolly/code-execution-environment/api-server@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
+    image: "ghcr.io/gjolly/code-execution-environment/api-server@sha256:97bef5111a02ca36e3d4f7244ad48b3662ba71247ba434b039a3e5d8007ddbf0" # v1.0.1
     # No `user:` — uid 0 is required to read the root-owned 0600 TLS key
     # mounted below (bind mounts do not remap ownership). Every other
     # hardening flag stays, so this is root with no capabilities on a
@@ -61,7 +61,7 @@ containers:
       - "/mnt/ramdisk/private/tls:/tinfoil/tls:ro"
 
   - name: "executor"
-    image: "ghcr.io/gjolly/code-execution-environment/executor@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
+    image: "ghcr.io/gjolly/code-execution-environment/executor@sha256:8bb39c844aea084b93d3ff431b90792e0d2124ddd1220c949862d3ad5f74c29b" # v1.0.1
     user: "1000:1000"
     read_only: true
     tmpfs:
