@@ -30,10 +30,17 @@ networks:
 containers:
   - name: "api-server"
     image: "ghcr.io/gjolly/code-execution-environment/api-server@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
-    # No `user:` — uid 0 is required to read the root-owned 0600 TLS key
-    # mounted below (bind mounts do not remap ownership). Every other
-    # hardening flag stays, so this is root with no capabilities on a
-    # read-only rootfs.
+    # uid 0 is required to read the root-owned 0600 TLS key mounted below
+    # (bind mounts do not remap ownership); owning the file is what grants
+    # the read, so no capability is involved. gid 1000 matches the group of
+    # the executor's 0660 socket: connect(2) needs write permission on it,
+    # and cap_drop ALL takes away the CAP_DAC_OVERRIDE that would otherwise
+    # let uid 0 ignore the mode bits. Fixing this by widening the socket
+    # instead would expose the executor's control API to the uid 1001 that
+    # /exec runs user code as, bypassing the audit chain entirely.
+    user: "0:1000"
+    # Every other hardening flag stays, so this is root with no capabilities
+    # on a read-only rootfs.
     read_only: true
     cap_drop: ["ALL"]
     security_opt:
