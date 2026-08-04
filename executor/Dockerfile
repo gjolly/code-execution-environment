@@ -25,7 +25,7 @@ RUN groupadd -g 1001 bashuser \
 # uid drop from root → 1000. Without this, --cap-add SETUID is in the
 # bounding set but not the effective set for a non-root process, and
 # /exec's setuid(1001) call returns EPERM.
-RUN apt-get update && apt-get install -y --no-install-recommends libcap2-bin \
+RUN apt-get update && apt-get install -y --no-install-recommends libcap2-bin curl \
     && setcap cap_setuid,cap_setgid+ep /executor \
     && apt-get purge -y libcap2-bin && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
