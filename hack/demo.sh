@@ -5,9 +5,10 @@
 # transcript and the signed checkpoint, and fetches a hardware attestation
 # bound to that transcript.
 #
-# This does NOT verify anything — it collects the material a verifier needs and
-# prints it. Verification (quote signature, launch measurement, tls_key_fp
-# match, chain replay) comes later.
+# It replays the hash chain, recomputes the attestation nonce, and verifies the
+# checkpoint signature under the certificate served on the TLS connection. It
+# does NOT verify the quote itself (signature chain to AMD/Intel roots, launch
+# measurement) — that comes later.
 #
 #   usage: hack/demo.sh https://<sandbox-domain> [--keep]
 #
@@ -131,6 +132,9 @@ exec_cmd 'ls -la'
 exec_cmd 'uname -r'
 exec_cmd 'lsblk'
 exec_cmd 'cat /etc/os-release'
+
+exec_cmd 'apt-get update'
+exec_cmd 'apt-get install -y curl'
 
 # ---------------------------------------------------------------------------
 bold "4. Egress through the recording proxy"
@@ -266,6 +270,65 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+bold "9. Checkpoint signature under the serving TLS certificate"
+if ! command -v openssl >/dev/null; then
+	dim "openssl not installed — skipping signature verification"
+else
+	HOSTPORT="${URL#*://}"
+	HOSTPORT="${HOSTPORT%%/*}"
+	SNI="${HOSTPORT%%:*}"
+	[[ "$HOSTPORT" == *:* ]] || HOSTPORT="$HOSTPORT:443"
+
+	# The leaf certificate as presented on this connection. Everything below is
+	# checked against that key, not against the pubkey the JSON handed us —
+	# otherwise the checkpoint would only be self-consistent.
+	openssl s_client -connect "$HOSTPORT" -servername "$SNI" </dev/null 2>/dev/null |
+		openssl x509 -outform pem >"$OUT/server-cert.pem" 2>/dev/null || true
+	[[ -s "$OUT/server-cert.pem" ]] || fail "could not fetch the TLS certificate from $HOSTPORT"
+	openssl x509 -in "$OUT/server-cert.pem" -pubkey -noout >"$OUT/server-pubkey.pem"
+	dim "  $(openssl x509 -in "$OUT/server-cert.pem" -noout -subject | sed 's/^subject=*//')"
+
+	# SHA-256 over the DER SubjectPublicKeyInfo — the same derivation boot uses
+	# for the value it puts in REPORT_DATA.
+	spki_fp() { openssl pkey -pubin -in "$1" -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1; }
+	CERT_FP=$(spki_fp "$OUT/server-pubkey.pem")
+	CP_FP=$(spki_fp "$OUT/checkpoint-pubkey.pem")
+
+	printf '  cert key fp           %s\n' "$CERT_FP"
+	printf '  checkpoint pubkey fp  %s\n' "$CP_FP"
+	if [[ -n "$CERT_FP" && "$CERT_FP" == "$CP_FP" && "$CERT_FP" == "$KEYFP" ]]; then
+		printf '  \033[32mthe checkpoint pubkey is the key of the cert terminating this connection\033[0m\n'
+	else
+		fail "checkpoint pubkey is not the serving certificate's key"
+	fi
+
+	# Reconstruct the exact bytes the enclave signed: compact JSON, struct field
+	# order (api-server/checkpoint.go Checkpoint), no trailing newline. All
+	# values are hex, base64 or RFC3339, so Go's HTML escaping never fires and
+	# jq reproduces them byte for byte.
+	jq -jc '.checkpoint | {segment_id, seq, audit_head, effective_policy_sha256, tls_key_fp, ts}' \
+		"$OUT/checkpoint.json" >"$OUT/checkpoint-body.json"
+	jq -r '.sig' "$OUT/checkpoint.json" | base64 -d >"$OUT/checkpoint.sig"
+
+	ALG=$(jq -r '.alg' "$OUT/checkpoint.json")
+	case "$ALG" in
+	ECDSA-P384-SHA384) DGST=-sha384 ;;
+	ECDSA-P256-SHA256) DGST=-sha256 ;;
+	*) fail "unsupported checkpoint alg $ALG" ;;
+	esac
+
+	printf '  alg                   %s\n' "$ALG"
+	if openssl dgst "$DGST" -verify "$OUT/server-pubkey.pem" \
+		-signature "$OUT/checkpoint.sig" "$OUT/checkpoint-body.json" >/dev/null 2>&1; then
+		printf '  \033[32msignature verifies — this CVM asserts head %s at seq %s\033[0m\n' \
+			"${AUDIT_HEAD:0:16}…" "$SEQ"
+	else
+		printf '  \033[31mSIGNATURE INVALID — the checkpoint is not signed by this CVM\033[0m\n'
+		exit 1
+	fi
+fi
+
+# ---------------------------------------------------------------------------
 bold "Collected"
 cat <<EOF
   $OUT/audit.ndjson           the transcript (hash-chained)
@@ -274,11 +337,12 @@ cat <<EOF
   $OUT/checkpoint-pubkey.pem  the CVM's TLS public key
   $OUT/attestation.json       hardware quote over our nonce
   $OUT/session.json           the effective policy
+  $OUT/server-cert.pem        the leaf cert served on this connection
+  $OUT/checkpoint-body.json   the exact bytes covered by the signature
 
 Still to verify (deliberately not done here):
   - quote signature chains to AMD/Intel roots
   - launch measurement matches the published release for this repo
-  - checkpoint signature verifies under checkpoint-pubkey.pem
 EOF
 [[ $KEEP -eq 0 ]] && dim "(run with --keep to retain these)"
 exit 0
