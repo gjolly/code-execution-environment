@@ -21,7 +21,42 @@ concurrency:
   group: tinfoil-container-release-${{ inputs.version }}
 
 jobs:
+  # Gate the release on the tests and on the config invariants the audit log
+  # depends on. cvmimage validates this file too, but its checks are about
+  # internal consistency — it accepts an executor attached directly to the
+  # egress network, which would make the transcript a record of only the
+  # traffic that chose to be recorded.
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+
+      # No setup-go: ubuntu-latest ships a Go toolchain, and Go fetches the
+      # exact version from each go.mod when it is newer.
+      - name: Check tinfoil-config.yml invariants
+        run: go run . ../../tinfoil-config.yml
+        working-directory: hack/configcheck
+
+      - name: Test api-server
+        run: go test ./...
+        working-directory: api-server
+
+      - name: Test executor
+        run: go test ./...
+        working-directory: executor
+
+      - name: Vet
+        run: |
+          (cd api-server && go vet ./...)
+          (cd executor && go vet ./...)
+
   build-api-server:
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read    # checkout + check the tag does not exist
@@ -76,6 +111,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
   build-executor:
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read    # checkout + check the tag does not exist

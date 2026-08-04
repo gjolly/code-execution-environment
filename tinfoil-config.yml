@@ -3,21 +3,65 @@ cvm-version: 0.7.5
 cpus: 2
 memory: 8192
 
+cvm-network:
+  # Nothing beyond the shim's :443. An entry here would bypass the shim
+  # entirely — unattested, unauthenticated inbound.
+  inbound-ports: []
+
+networks:
+  # Null body means `egress: closed`: no forward rule is installed for this
+  # bridge, so the kernel drops anything the executor sends toward the
+  # internet. Same-bridge traffic to api-server is still accepted, so the
+  # proxy is the executor's only reachable peer. This is what makes the audit
+  # log's claim of completeness true rather than merely intended — and this
+  # file's SHA-256 is in the kernel cmdline, so it is in the launch
+  # measurement.
+  sandbox-net:
+
+  # The api-server's own egress. This allowlist is the CEILING: it is enforced
+  # by nftables over resolved IPv4 addresses and cannot be widened at runtime.
+  # A per-session L7 policy may narrow it, never exceed it.
+  egress-net:
+    egress: allowlist
+    allow:
+      - pypi.org
+      - files.pythonhosted.org
+      - registry.npmjs.org
+
 containers:
   - name: "api-server"
-    image: "ghcr.io/tinfoilsh/code-execution-environment/api-server@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
-    user: "1000:1000"
+    image: "ghcr.io/gjolly/code-execution-environment/api-server@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
+    # No `user:` — uid 0 is required to read the root-owned 0600 TLS key
+    # mounted below (bind mounts do not remap ownership). Every other
+    # hardening flag stays, so this is root with no capabilities on a
+    # read-only rootfs.
     read_only: true
     cap_drop: ["ALL"]
     security_opt:
       - "no-new-privileges:true"
     memory: "1g"
     cpus: 0.5
+    networks: ["sandbox-net", "egress-net"]
+    env:
+      # Mirrors networks.egress-net.allow above. Kept as an env var so the
+      # api-server needs no YAML parser: it holds the enclave TLS key, and
+      # every dependency there is attack surface on that key. Written in
+      # `VAR: value` map form, so it is hardcoded into this measured file —
+      # the same attested bytes as the allow list it mirrors. KEEP IN SYNC.
+      - EGRESS_CEILING: "pypi.org,files.pythonhosted.org,registry.npmjs.org"
     volumes:
       - "execsock:/run/execsock"
+      # The CVM's TLS key, used to sign audit checkpoints. tls_key_fp is a
+      # REPORT_DATA input the client cannot choose, so a signature under this
+      # key is what ties a transcript to this specific CVM instance — the
+      # attestation nonce alone cannot, being client-supplied. Mount the
+      # DIRECTORY: boot writes key.pem partway through startup, and Docker
+      # would otherwise create a directory at a missing file's mount target.
+      # See api-server/checkpoint.go for the tradeoff this accepts.
+      - "/mnt/ramdisk/private/tls:/tinfoil/tls:ro"
 
   - name: "executor"
-    image: "ghcr.io/tinfoilsh/code-execution-environment/executor@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
+    image: "ghcr.io/gjolly/code-execution-environment/executor@sha256:0000000000000000000000000000000000000000000000000000000000000000" # placeholder - populated during release
     user: "1000:1000"
     read_only: true
     tmpfs:
@@ -32,12 +76,17 @@ containers:
       - "no-new-privileges:true"
     memory: "6g" # Could be smaller but no need
     cpus: 1.5
-    network_mode: "none"
+    # Replaces network_mode: "none". The sandbox now has exactly one reachable
+    # peer — the api-server's proxy — and no route anywhere else.
+    networks: ["sandbox-net"]
     volumes:
       - "execsock:/run/execsock"
 
 shim:
   upstream-port: 8000
+  # Explicit rather than defaulting to containers[0], since the audit surface
+  # depends on the api-server being the shim's upstream.
+  upstream-container: "api-server"
   paths:
     - /exec
     - /read
@@ -47,3 +96,4 @@ shim:
     - /sync-uploads/manifest
     - /sync-uploads/blobs
     - /health
+    - /audit/*

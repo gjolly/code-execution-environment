@@ -104,10 +104,23 @@ func withFakeExecutor(t *testing.T, handler http.HandlerFunc) func() {
 	oldGate := g
 	g = &gate{state: lifecycleWarm}
 
+	oldAudit := auditRecorder
+	auditRecorder = NewAuditLog()
+
 	return func() {
 		srv.Close()
 		executorClient = oldClient
 		g = oldGate
+		auditRecorder = oldAudit
+	}
+}
+
+// activate moves the gate out of warm and claims the token, which /snapshot
+// requires: a warm container has nothing worth snapshotting.
+func activate(t *testing.T, token string) {
+	t.Helper()
+	if _, _, ok := g.check("/exec", token); !ok {
+		t.Fatal("failed to activate gate")
 	}
 }
 
@@ -140,6 +153,8 @@ func TestProxy_KillsAfterSnapshotWithTrailer(t *testing.T) {
 		w.Header().Set(snapshotTrailer, "ok")
 	})()
 
+	activate(t, "tok")
+
 	req := httptest.NewRequest(http.MethodPost, "/snapshot", nil)
 	req.Header.Set(authTokenHeader, "tok")
 	w := httptest.NewRecorder()
@@ -161,6 +176,8 @@ func TestProxy_DoesNotKillWithoutTrailer(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		io.WriteString(w, `{"tar":"truncated`) // no trailer, no closing }
 	})()
+
+	activate(t, "tok")
 
 	req := httptest.NewRequest(http.MethodPost, "/snapshot", nil)
 	req.Header.Set(authTokenHeader, "tok")
@@ -205,10 +222,11 @@ func TestHealth_ExecutorDown(t *testing.T) {
 	}
 }
 
-// /snapshot bypasses the auth-token lock — the orchestrator triggers
-// eviction snapshots without a per-user auth token in flight. The
-// request must pass through to the executor even with no auth header.
-func TestProxy_SnapshotBypassesAuth(t *testing.T) {
+// /snapshot must require the auth token like every other path. It used to
+// bypass it, which let anyone able to reach this port exfiltrate the workspace
+// and permanently kill the session. The orchestrator already holds the token
+// when it snapshots, so there is no reason to exempt it.
+func TestProxy_SnapshotRequiresAuthToken(t *testing.T) {
 	defer withFakeExecutor(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		io.WriteString(w, `{"tar":"AAAA"}`)
@@ -219,8 +237,11 @@ func TestProxy_SnapshotBypassesAuth(t *testing.T) {
 	w := httptest.NewRecorder()
 	proxyHandler(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status: got %d, want 200 (snapshot must bypass auth)", w.Code)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status: got %d, want 401 (snapshot must not bypass auth)", w.Code)
+	}
+	if g.state == lifecycleKilled {
+		t.Error("an unauthenticated snapshot must not kill the session")
 	}
 }
 
@@ -246,6 +267,8 @@ func TestProxy_DoesNotKillOnSnapshotError(t *testing.T) {
 	defer withFakeExecutor(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	})()
+
+	activate(t, "tok")
 
 	req := httptest.NewRequest(http.MethodPost, "/snapshot", nil)
 	req.Header.Set(authTokenHeader, "tok")

@@ -84,6 +84,10 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 
 	cmd := exec.CommandContext(ctx, "bash", "-c", req.Command)
 	cmd.Dir = workspace
+	// Point HTTP clients at the egress proxy and its CA. Enforcement is the
+	// kernel's job (the sandbox network is `egress: closed`); this only makes
+	// well-behaved tooling take the route that gets recorded.
+	cmd.Env = commandEnv()
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		// Put bash in its own process group so timeout / cancellation kills grandchildren.
 		Setpgid:    true,
@@ -233,6 +237,7 @@ func main() {
 	mux.HandleFunc("/restore", handleRestore)
 	mux.HandleFunc("/sync-uploads/manifest", handleSyncUploadsManifest)
 	mux.HandleFunc("/sync-uploads/blobs", handleSyncUploadsBlobs)
+	mux.HandleFunc("/session/init", handleSessionInit)
 	mux.HandleFunc("/health", handleHealth)
 
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
