@@ -213,32 +213,6 @@ func TestCheckpoint_ForeignKeyIsRejected(t *testing.T) {
 	}
 }
 
-func TestAttestationNonce_BindsAllThreeInputs(t *testing.T) {
-	head := strings.Repeat("aa", 32)
-	policy := strings.Repeat("bb", 32)
-	chal := make([]byte, 32)
-
-	base, err := AttestationNonce(head, policy, chal)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(base) != 64 {
-		t.Fatalf("nonce is %d hex chars, want 64 — the shim requires exactly 32 bytes", len(base))
-	}
-
-	otherHead, _ := AttestationNonce(strings.Repeat("ac", 32), policy, chal)
-	otherPolicy, _ := AttestationNonce(head, strings.Repeat("bc", 32), chal)
-	otherChal, _ := AttestationNonce(head, policy, append(chal[:31], 1))
-
-	for name, got := range map[string]string{
-		"head": otherHead, "policy": otherPolicy, "challenge": otherChal,
-	} {
-		if got == base {
-			t.Errorf("changing the %s did not change the nonce", name)
-		}
-	}
-}
-
 // ---- listener isolation ----
 
 // The sandbox-facing listener serves proxy protocol only. If it ever answered

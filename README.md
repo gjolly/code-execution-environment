@@ -76,8 +76,7 @@ POST /audit/session  {"allow":[...], "deny":[...], "tunnel_only":[...]}
                      → {"effective_policy_sha256":"...", "rejected":[...]}
                      Install the session policy. Must precede user traffic.
 
-GET  /audit/head?challenge=<64 hex>
-                     → {seq, audit_head, policy, nonce, signed_checkpoint}
+GET  /audit/head     → {seq, audit_head, policy, signed_checkpoint}
 
 GET  /audit/log?from=&to=
                      → NDJSON; the exact bytes the chain hashes
@@ -88,21 +87,20 @@ POST /audit/resume   {"prev_segment_id","prev_head","prev_checkpoint"}
 
 ### Verifying a transcript
 
-The attestation nonce is chosen by the client, so a quote over it is *not* an
-assertion by the enclave — anyone running their own CVM on the same released
-image can obtain one over someone else's log head. What the quote binds
-unforgeably is `tls_key_fp`. So the api-server signs each checkpoint with the
-CVM's TLS key, and step 4 below is what actually establishes provenance.
+The attestation nonce is chosen by the client, so a quote can never *assert* a
+log head — anyone running their own CVM on the same released image could obtain
+one over any value. What the quote binds unforgeably is `tls_key_fp`. So the
+api-server signs each checkpoint (head included) with the CVM's TLS key, and
+step 3 below is what actually establishes provenance; the quote's only job is to
+prove that signing key lives in a genuine, correctly-measured enclave.
 
 ```
 1. quote signature chains to AMD/Intel roots
 2. launch measurement == the released tinfoil-deployment.json  (pins the
    api-server image digest AND the networks: stanza)
-3. ReportData.Nonce == SHA256("tinfoil-sandbox-audit/v1" || audit_head
-                              || effective_policy_sha256 || challenge)
-4. ReportData.TLSKeyFP == SHA256(DER SPKI of checkpoint.pubkey)   ← provenance
-5. checkpoint signature verifies under that key
-6. checkpoint.audit_head matches, and replaying /audit/log reproduces it
+3. ReportData.TLSKeyFP == SHA256(DER SPKI of checkpoint.pubkey)   ← provenance
+4. checkpoint signature verifies under that key
+5. checkpoint.audit_head matches, and replaying /audit/log reproduces it
 ```
 
 Yielding: *the log with this head, under this policy, was produced by that exact

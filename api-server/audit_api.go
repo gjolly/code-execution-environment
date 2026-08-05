@@ -4,7 +4,6 @@
 package main
 
 import (
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -50,16 +49,14 @@ func (a *auditAPI) requireSigner(w http.ResponseWriter) (*Signer, bool) {
 	return nil, false
 }
 
-// headResponse is what a verifier needs to drive the attestation binding. It
-// carries the inputs to the nonce so the client can recompute it independently
-// rather than trusting the value we return.
+// headResponse is what a verifier needs to drive the attestation binding. The
+// load-bearing field is signed_checkpoint: the enclave's signature over the
+// head is what a verifier trusts, so there is no client challenge to echo here.
 type headResponse struct {
 	SegmentID string            `json:"segment_id"`
 	Seq       int               `json:"seq"`
 	AuditHead string            `json:"audit_head"`
 	Policy    map[string]string `json:"policy"`
-	Challenge string            `json:"challenge,omitempty"`
-	Nonce     string            `json:"nonce,omitempty"`
 	StartedAt string            `json:"started_at"`
 	Signed    *SignedCheckpoint `json:"signed_checkpoint"`
 	Saturated bool              `json:"saturated"`
@@ -88,23 +85,6 @@ func (a *auditAPI) handleHead(w http.ResponseWriter, r *http.Request) {
 		Policy:    policyInfo,
 		StartedAt: a.audit.StartedAt().Format("2006-01-02T15:04:05.999999999Z07:00"),
 		Saturated: a.audit.Saturated(),
-	}
-
-	// The challenge is the client's; an enclave-chosen value would prove
-	// nothing about freshness to a remote verifier.
-	if chal := r.URL.Query().Get("challenge"); chal != "" {
-		raw, err := hex.DecodeString(chal)
-		if err != nil || len(raw) != 32 {
-			writeJSONError(w, http.StatusBadRequest, "challenge must be 32 bytes (64 hex chars)")
-			return
-		}
-		nonce, err := AttestationNonce(head, policyHash, raw)
-		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		resp.Challenge = chal
-		resp.Nonce = nonce
 	}
 
 	signed, err := signer.Sign(a.audit.SegmentID(), seq, head, policyHash)

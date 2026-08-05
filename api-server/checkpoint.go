@@ -1,15 +1,19 @@
 // Checkpoints bind the audit chain to the CVM's hardware root of trust.
 //
 // The problem this solves: the shim's attestation nonce is chosen by the
-// client (cvmimage cmd/shim/api.go), so a quote over a nonce derived from a
-// log head is NOT an assertion by the enclave — anyone running their own CVM
-// on the same released image can obtain one over someone else's log. What the
+// client (cvmimage cmd/shim/api.go), so feeding a quote a nonce that commits
+// to a log head proves nothing — anyone running their own CVM on the same
+// released image can obtain such a quote over someone else's log. What the
 // quote binds unforgeably is tls_key_fp, a REPORT_DATA input the client cannot
 // choose and which is unique per CVM boot (cvmimage cmd/boot/identity.go
 // generates a fresh P-384 key each boot and reuses it across cert renewals).
 //
-// So provenance requires the *enclave* to sign the checkpoint with the TLS
-// key. We get at it by bind-mounting the private ramdisk's TLS directory into
+// So provenance runs the other way: the *enclave* signs the checkpoint —
+// including the current audit_head — with the TLS key, and the quote's role is
+// only to prove that key lives in a genuine, correctly-measured enclave. The
+// quote nonce is therefore just a fresh client value for liveness; it does not
+// carry the head. We get at the signing key by bind-mounting the private
+// ramdisk's TLS directory into
 // this container read-only. A verifier then checks:
 //
 //	quote.ReportData.TLSKeyFP == SHA256(DER SPKI of checkpoint.pubkey)
@@ -46,11 +50,6 @@ const (
 	// checkpointAlg is recorded in the served document so a verifier never
 	// has to infer it from the key.
 	checkpointAlg = "ECDSA-P384-SHA384"
-
-	// Domain separator for the attestation nonce. Distinct from any other
-	// use of the audit head so a nonce can never be mistaken for a different
-	// kind of commitment.
-	nonceDomainSep = "tinfoil-sandbox-audit/v1"
 )
 
 // Checkpoint is the signed statement. Field order is the serialization order
@@ -192,29 +191,6 @@ func (s *Signer) Sign(segmentID string, seq int, auditHead, policyHash string) (
 		PubKey:     s.pubPEM,
 		Binding:    nil,
 	}, nil
-}
-
-// AttestationNonce derives the 32-byte nonce the client passes to the shim's
-// /.well-known/tinfoil-attestation. SHA-256 output is exactly the 32 bytes the
-// shim requires, which is what makes this binding possible with no platform
-// change. The challenge is supplied by the client: an enclave-chosen value
-// would prove nothing about freshness to a remote verifier.
-func AttestationNonce(auditHead, policyHash string, challenge []byte) (string, error) {
-	headBytes, err := hex.DecodeString(auditHead)
-	if err != nil {
-		return "", fmt.Errorf("audit head is not hex: %w", err)
-	}
-	policyBytes, err := hex.DecodeString(policyHash)
-	if err != nil {
-		return "", fmt.Errorf("policy hash is not hex: %w", err)
-	}
-
-	h := sha256.New()
-	h.Write([]byte(nonceDomainSep))
-	h.Write(headBytes)
-	h.Write(policyBytes)
-	h.Write(challenge)
-	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // logSignerReady records the fingerprint at startup so it can be correlated

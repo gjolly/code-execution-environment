@@ -5,10 +5,9 @@
 # transcript and the signed checkpoint, and fetches a hardware attestation
 # bound to that transcript.
 #
-# It replays the hash chain, recomputes the attestation nonce, and verifies the
-# checkpoint signature under the certificate served on the TLS connection. It
-# does NOT verify the quote itself (signature chain to AMD/Intel roots, launch
-# measurement) — that comes later.
+# It replays the hash chain and verifies the checkpoint signature under the
+# certificate served on the TLS connection. It does NOT verify the quote itself
+# (signature chain to AMD/Intel roots, launch measurement) — that comes later.
 #
 #   usage: hack/demo.sh https://<sandbox-domain> [--keep]
 #
@@ -32,9 +31,6 @@ done
 
 # 32 random bytes as hex, without depending on openssl.
 randhex32() { od -An -N32 -tx1 /dev/urandom | tr -d ' \n'; }
-
-# Hex string -> raw bytes on stdout, without depending on xxd.
-unhex() { printf '%b' "$(sed 's/../\\x&/g' <<<"$1")"; }
 
 OUT=$(mktemp -d -t sandbox-demo-XXXXXX)
 cleanup() {
@@ -145,16 +141,14 @@ exec_cmd 'curl -sS -o /dev/null -w "%{http_code}\n" --max-time 20 https://evil.e
 
 # ---------------------------------------------------------------------------
 bold "5. Attested head"
-# The challenge is ours: an enclave-chosen value would prove nothing about
-# freshness. The api-server returns the nonce it derived; we recompute it below
-# so we are not taking its word for the binding.
-CHALLENGE=$(randhex32)
-HEAD=$(call GET "/audit/head?challenge=$CHALLENGE")
+# Provenance rests entirely on the enclave's signature over the head (section 9),
+# not on the quote nonce. So the head fetch needs no challenge; the transcript's
+# authenticity comes from the signed checkpoint served here.
+HEAD=$(call GET "/audit/head")
 echo "$HEAD" | jq . >"$OUT/head.json"
 
 AUDIT_HEAD=$(jq -r '.audit_head' <<<"$HEAD")
 POLICY_SHA=$(jq -r '.policy.effective_sha256 // ""' <<<"$HEAD")
-NONCE=$(jq -r '.nonce' <<<"$HEAD")
 SEQ=$(jq -r '.seq' <<<"$HEAD")
 KEYFP=$(jq -r '.signed_checkpoint.checkpoint.tls_key_fp' <<<"$HEAD")
 
@@ -162,24 +156,6 @@ printf '  seq          %s\n' "$SEQ"
 printf '  audit_head   %s\n' "$AUDIT_HEAD"
 printf '  policy sha   %s\n' "$POLICY_SHA"
 printf '  tls_key_fp   %s\n' "$KEYFP"
-printf '  nonce        %s\n' "$NONCE"
-
-# Recompute the nonce independently:
-#   SHA256("tinfoil-sandbox-audit/v1" || audit_head || effective_policy || challenge)
-# with the three hex values as raw bytes.
-LOCAL_NONCE=$(
-	{
-		printf 'tinfoil-sandbox-audit/v1'
-		unhex "$AUDIT_HEAD"
-		unhex "$POLICY_SHA"
-		unhex "$CHALLENGE"
-	} | sha256sum | cut -d' ' -f1
-)
-if [[ "$LOCAL_NONCE" == "$NONCE" ]]; then
-	printf '  \033[32mnonce recomputed locally and matches\033[0m\n'
-else
-	printf '  \033[31mnonce MISMATCH — local %s\033[0m\n' "$LOCAL_NONCE"
-fi
 
 jq -r '.signed_checkpoint.pubkey' <<<"$HEAD" >"$OUT/checkpoint-pubkey.pem"
 jq '.signed_checkpoint' <<<"$HEAD" >"$OUT/checkpoint.json"
@@ -238,8 +214,12 @@ if [[ $BROKEN -eq 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-bold "8. Hardware attestation bound to that head"
-dim "GET /.well-known/tinfoil-attestation?nonce=<nonce over head+policy+challenge>"
+bold "8. Hardware attestation binding the signing key to this CVM"
+# The nonce is a fresh random value for liveness only — it does NOT carry the
+# head. What matters is REPORT_DATA.tls_key_fp: it proves the key that signs the
+# checkpoint (section 9) lives in this measured enclave.
+NONCE=$(randhex32)
+dim "GET /.well-known/tinfoil-attestation?nonce=<fresh random>"
 curl --silent --show-error \
 	"$URL/.well-known/tinfoil-attestation?nonce=$NONCE" >"$OUT/attestation.json" ||
 	fail "fetching attestation"
