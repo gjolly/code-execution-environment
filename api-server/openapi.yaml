@@ -1,0 +1,669 @@
+openapi: 3.1.0
+info:
+  title: Tinfoil Code Execution — api-server control API
+  version: "1.0.0"
+  description: |
+    The api-server runs inside the CVM in front of the executor container. It
+    exposes two listeners:
+
+      * **Control listener** (`shimUpstreamIP:8000`, `172.31.255.2:8000` in the
+        CVM; overridable via `CONTROL_LISTEN` for local dev). Bound to the
+        shim-net address *only* so nothing on the sandbox network can reach it.
+        This is the surface documented by this spec.
+
+      * **Egress proxy** (`:3128`, overridable via `PROXY_LISTEN`). A standard
+        intercepting **forward HTTP proxy** (absolute-form requests + `CONNECT`)
+        used by the executor for outbound traffic, governed by the session
+        policy and the attested egress ceiling. It is *not* a REST surface and
+        is therefore not described with paths here — point an HTTP client's
+        proxy setting at it rather than calling operations on it.
+
+    ## Two families of control endpoints
+
+    * **Tool-call / lifecycle passthrough** (`/exec`, `/read`, `/write`,
+      `/snapshot`, `/restore`, `/sync-uploads/*`): proxied over a unix socket to
+      the executor. All are `POST`, all pass the auth-token + lifecycle gate,
+      and the request/response bodies are the executor's own shapes (reproduced
+      here). Small audit-relevant calls are buffered and recorded as structured
+      audit entries; bulk transfers are streamed and recorded as salted hashes.
+
+    * **Audit surface** (`/audit/*`) and **health** (`/health`): served directly
+      by the api-server. `/audit/*` is auth-only (no lifecycle check) so it can
+      run before `/restore` and remain readable after `/snapshot`.
+
+    ## Lifecycle gate
+
+    The container has a per-lifetime state machine:
+
+      * `warm`  — no user traffic yet. `/restore` is allowed (idempotent retry);
+        `/exec`, `/read`, `/write`, `/sync-uploads/*` transition it to `active`;
+        `/snapshot` on a warm container is rejected with `410`.
+      * `active` — user traffic has begun. `/restore` returns `410`; a
+        successful `/snapshot` transitions to `killed`.
+      * `killed` — snapshot taken. Every gated call returns `410`. The
+        `/audit/*` surface stays available (that is when the transcript is
+        collected).
+
+    The first caller's non-empty auth token locks the gate; later callers must
+    present the same token.
+
+servers:
+  - url: http://172.31.255.2:8000
+    description: In-CVM control listener (shim-net address)
+  - url: http://127.0.0.1:8000
+    description: Local dev (set CONTROL_LISTEN)
+
+tags:
+  - name: tool-call
+    description: Proxied executor tool calls (buffered + audited).
+  - name: lifecycle
+    description: Proxied bulk workspace transfers (streamed + audited).
+  - name: audit
+    description: Transcript, signed checkpoints and session policy.
+  - name: health
+    description: Liveness / readiness.
+
+components:
+  securitySchemes:
+    containerAuthToken:
+      type: apiKey
+      in: header
+      name: X-Code-Execution-Container-Auth-Token
+      description: |
+        Per-container auth token. The first non-empty value seen locks the
+        gate; every subsequent request must present the identical token.
+
+  responses:
+    JSONError:
+      description: Error envelope.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing container auth token.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "missing container auth token" }
+    Forbidden:
+      description: Container auth token mismatch.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "container auth token mismatch" }
+    Gone:
+      description: The lifecycle state disallows this call (session ended, restore
+        window closed, or snapshot attempted while warm).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "container session ended" }
+    MethodNotAllowed:
+      description: Only POST is accepted on the proxied endpoints.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "method not allowed" }
+    BadGateway:
+      description: The executor could not be reached over the unix socket.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "executor unavailable: dial unix ..." }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+      required: [error]
+
+    # ---- executor tool-call shapes (proxied verbatim) ----
+    ExecRequest:
+      type: object
+      properties:
+        command:
+          type: string
+          description: Shell command run by bash inside /workspace.
+      required: [command]
+    ExecResponse:
+      type: object
+      properties:
+        stdout: { type: string }
+        stderr: { type: string }
+        exit_code: { type: integer }
+      required: [stdout, stderr, exit_code]
+
+    ReadRequest:
+      type: object
+      properties:
+        path:
+          type: string
+          description: Path relative to /workspace. Resolved with
+            openat2(RESOLVE_BENEATH); escapes are rejected.
+      required: [path]
+    ReadResponse:
+      type: object
+      properties:
+        path: { type: string }
+        contents: { type: string }
+      required: [path, contents]
+
+    WriteRequest:
+      type: object
+      properties:
+        path: { type: string }
+        contents: { type: string }
+      required: [path, contents]
+    WriteResponse:
+      type: object
+      properties:
+        path: { type: string }
+        size: { type: integer }
+      required: [path, size]
+
+    SnapshotResponse:
+      type: object
+      description: |
+        Base64-encoded tar of /workspace. Emitted with a chunked trailer
+        `X-Snapshot-Status: ok`; the api-server transitions the gate to
+        `killed` only when that trailer is present on a 200.
+      properties:
+        tar:
+          type: string
+          contentEncoding: base64
+      required: [tar]
+
+    RestoreRequest:
+      type: object
+      properties:
+        tar:
+          type: string
+          contentEncoding: base64
+          description: Raw plaintext tar bytes, base64-encoded, to unpack into
+            /workspace.
+      required: [tar]
+    RestoreResponse:
+      type: object
+      properties:
+        status: { type: string }
+      required: [status]
+
+    UploadEntry:
+      type: object
+      properties:
+        filename: { type: string }
+        sha256: { type: string }
+      required: [filename, sha256]
+    UploadBlob:
+      type: object
+      properties:
+        filename: { type: string }
+        sha256: { type: string }
+        contents:
+          type: string
+          contentEncoding: base64
+      required: [filename, sha256, contents]
+    SyncManifestRequest:
+      type: object
+      properties:
+        manifest:
+          type: array
+          items: { $ref: "#/components/schemas/UploadEntry" }
+      required: [manifest]
+    SyncManifestResponse:
+      type: object
+      properties:
+        missing:
+          type: array
+          description: Subset of the manifest whose blobs are not yet present.
+          items: { $ref: "#/components/schemas/UploadEntry" }
+      required: [missing]
+    SyncBlobsRequest:
+      type: object
+      properties:
+        files:
+          type: array
+          items: { $ref: "#/components/schemas/UploadBlob" }
+      required: [files]
+    SyncBlobsResponse:
+      type: object
+      properties:
+        written: { type: integer }
+      required: [written]
+
+    # ---- audit / policy shapes ----
+    Policy:
+      type: object
+      description: |
+        Session-supplied ruleset. Rules are `scheme://host/pathglob` or a bare
+        host. Deny is evaluated before Allow; anything unmatched is denied.
+      properties:
+        allow:
+          type: array
+          items: { type: string }
+        deny:
+          type: array
+          items: { type: string }
+        tunnel_only:
+          type: array
+          description: Hosts passed through as raw CONNECT tunnels (host-granular,
+            not intercepted).
+          items: { type: string }
+        max_response_bytes:
+          type: integer
+          format: int64
+    EffectivePolicy:
+      type: object
+      description: The composed policy actually enforced, with the audit trail of
+        how it was derived from the ceiling ∩ request.
+      properties:
+        ceiling:
+          type: array
+          items: { type: string }
+        requested: { $ref: "#/components/schemas/Policy" }
+        effective: { $ref: "#/components/schemas/Policy" }
+        rejected:
+          type: array
+          items: { type: string }
+        ceiling_sha256: { type: string }
+        requested_sha256: { type: string }
+        effective_sha256: { type: string }
+    Checkpoint:
+      type: object
+      description: |
+        The signed statement. Field order is the serialization order and is
+        load-bearing — the signature covers these exact bytes.
+      properties:
+        segment_id: { type: string }
+        seq: { type: integer }
+        audit_head: { type: string }
+        effective_policy_sha256: { type: string }
+        tls_key_fp:
+          type: string
+          description: SHA-256 over the DER SubjectPublicKeyInfo of the CVM TLS
+            key. Matched against REPORT_DATA in the hardware quote.
+        ts: { type: string, format: date-time }
+      required: [segment_id, seq, audit_head, effective_policy_sha256, tls_key_fp, ts]
+    SignedCheckpoint:
+      type: object
+      properties:
+        checkpoint: { $ref: "#/components/schemas/Checkpoint" }
+        alg:
+          type: string
+          example: ECDSA-P384-SHA384
+        sig:
+          type: string
+          description: base64, ASN.1 DER ECDSA signature over the checkpoint bytes.
+        pubkey:
+          type: string
+          description: PEM SubjectPublicKeyInfo. In v1 this *is* the CVM TLS key.
+        binding:
+          type: [object, "null"]
+          description: Null in v1; reserved for a boot-derived audit key's
+            signature.
+      required: [checkpoint, alg, sig, pubkey]
+    HeadResponse:
+      type: object
+      properties:
+        segment_id: { type: string }
+        seq: { type: integer }
+        audit_head: { type: string }
+        policy:
+          type: object
+          additionalProperties: { type: string }
+          description: requested/effective/ceiling SHA-256s; empty before
+            /audit/session lands.
+        started_at: { type: string, format: date-time }
+        signed_checkpoint: { $ref: "#/components/schemas/SignedCheckpoint" }
+        saturated:
+          type: boolean
+          description: True once the in-memory log has dropped entries.
+      required: [segment_id, seq, audit_head, started_at, signed_checkpoint]
+    SessionResponse:
+      type: object
+      properties:
+        effective_policy_sha256: { type: string }
+        rejected:
+          type: array
+          items: { type: string }
+        mitm_ca_sha256: { type: string }
+      required: [effective_policy_sha256, rejected, mitm_ca_sha256]
+    ResumeRequest:
+      type: object
+      properties:
+        prev_segment_id: { type: string }
+        prev_head: { type: string }
+        prev_checkpoint:
+          description: The prior segment's signed checkpoint, verbatim.
+      required: [prev_segment_id, prev_head]
+    ResumeResponse:
+      type: object
+      properties:
+        segment_id: { type: string }
+      required: [segment_id]
+    HealthResponse:
+      type: object
+      properties:
+        executor:
+          type: string
+          enum: [ok, unreachable]
+        checkpoint_signer:
+          type: string
+          description: '"ready", "loading", or "failed: <reason>".'
+      required: [executor, checkpoint_signer]
+
+paths:
+  /exec:
+    post:
+      tags: [tool-call]
+      summary: Run a shell command in the workspace
+      description: Proxied to the executor. Buffered and recorded as an `exec`
+        audit entry (command in the clear; stdout/stderr as salted hashes+lengths).
+      security: [{ containerAuthToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ExecRequest" }
+      responses:
+        "200":
+          description: Command result.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ExecResponse" }
+        "400": { $ref: "#/components/responses/JSONError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "410": { $ref: "#/components/responses/Gone" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+
+  /read:
+    post:
+      tags: [tool-call]
+      summary: Read a file from the workspace
+      security: [{ containerAuthToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReadRequest" }
+      responses:
+        "200":
+          description: File contents.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReadResponse" }
+        "400": { $ref: "#/components/responses/JSONError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "410": { $ref: "#/components/responses/Gone" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+
+  /write:
+    post:
+      tags: [tool-call]
+      summary: Write a file into the workspace
+      security: [{ containerAuthToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WriteRequest" }
+      responses:
+        "200":
+          description: Bytes written.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WriteResponse" }
+        "400": { $ref: "#/components/responses/JSONError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "410": { $ref: "#/components/responses/Gone" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+
+  /sync-uploads/manifest:
+    post:
+      tags: [tool-call]
+      summary: Diff an upload manifest against present blobs
+      description: Returns the subset of entries whose blobs are not yet stored.
+        Recorded as an `upload` audit entry.
+      security: [{ containerAuthToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SyncManifestRequest" }
+      responses:
+        "200":
+          description: Missing entries.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SyncManifestResponse" }
+        "400": { $ref: "#/components/responses/JSONError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "410": { $ref: "#/components/responses/Gone" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+
+  /sync-uploads/blobs:
+    post:
+      tags: [tool-call]
+      summary: Upload blob contents
+      security: [{ containerAuthToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SyncBlobsRequest" }
+      responses:
+        "200":
+          description: Count written.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SyncBlobsResponse" }
+        "400": { $ref: "#/components/responses/JSONError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "410": { $ref: "#/components/responses/Gone" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+
+  /snapshot:
+    post:
+      tags: [lifecycle]
+      summary: Snapshot the workspace and end the session
+      description: |
+        Streams a base64 tar of /workspace. Recorded as a bulk `snapshot` audit
+        entry (salted hash + size). A 200 carrying trailer
+        `X-Snapshot-Status: ok` is the terminal lifecycle event — the gate moves
+        to `killed`. Rejected with 410 if the container is still `warm`.
+      security: [{ containerAuthToken: [] }]
+      responses:
+        "200":
+          description: Base64 tar of the workspace, with a chunked trailer.
+          headers:
+            X-Snapshot-Status:
+              description: '"ok" once the tar completed cleanly (chunked trailer).'
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SnapshotResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "410": { $ref: "#/components/responses/Gone" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+
+  /restore:
+    post:
+      tags: [lifecycle]
+      summary: Restore a workspace from a snapshot
+      description: |
+        Unpacks a base64 tar into /workspace. Allowed only while `warm`
+        (idempotent retry keeps the container warm); returns 410 once the
+        session is `active` or `killed`.
+      security: [{ containerAuthToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RestoreRequest" }
+      responses:
+        "200":
+          description: Restore status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RestoreResponse" }
+        "400": { $ref: "#/components/responses/JSONError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "410": { $ref: "#/components/responses/Gone" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+
+  /health:
+    get:
+      tags: [health]
+      summary: Liveness / readiness
+      description: Returns 200 only when the executor is reachable; 503 otherwise.
+        The body reports executor reachability and checkpoint-signer state.
+      responses:
+        "200":
+          description: Executor reachable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HealthResponse" }
+        "503":
+          description: Executor unreachable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HealthResponse" }
+
+  /audit/head:
+    get:
+      tags: [audit]
+      summary: Signed head of the audit chain
+      description: |
+        Returns the current segment id, sequence, audit head and policy hashes,
+        plus a freshly signed checkpoint over that head. Requires the checkpoint
+        signer (the mounted CVM TLS key); 503 until it is loaded.
+
+        Auth-only — deliberately no lifecycle check, so the head remains
+        readable after `/snapshot` has moved the gate to `killed`.
+      security: [{ containerAuthToken: [] }]
+      responses:
+        "200":
+          description: Signed head.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HeadResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/JSONError" }
+        "503":
+          description: Checkpoint signer not ready / unavailable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /audit/log:
+    get:
+      tags: [audit]
+      summary: Stream the raw audit chain
+      description: |
+        Streams the exact bytes the chain hashes, one entry per line
+        (`application/x-ndjson`), so a verifier recomputes
+        `H(i) = sha256(line_i)` without agreeing on a JSON canonicalization.
+      security: [{ containerAuthToken: [] }]
+      parameters:
+        - name: from
+          in: query
+          description: First sequence number (inclusive). Default 0.
+          schema: { type: integer, default: 0 }
+        - name: to
+          in: query
+          description: Last sequence number (exclusive; 0 means to the head).
+          schema: { type: integer, default: 0 }
+      responses:
+        "200":
+          description: NDJSON stream of chain entries.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /audit/session:
+    post:
+      tags: [audit]
+      summary: Install the per-session egress policy
+      description: |
+        Composes the requested policy with the attested ceiling and records the
+        result as the first chain entry. Must be called before any user traffic.
+        Rules outside the ceiling are dropped and reported in `rejected`.
+      security: [{ containerAuthToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Policy" }
+      responses:
+        "200":
+          description: Effective policy summary.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionResponse" }
+        "400":
+          description: Invalid policy JSON.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/JSONError" }
+        "507":
+          description: Could not append the session-start entry to the log.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /audit/resume:
+    post:
+      tags: [audit]
+      summary: Continue a prior segment's chain in this CVM
+      description: |
+        Adopts a previous segment so a multi-hop session forms a sequence of
+        per-CVM segments linked by resume entries. Each hop is a distinct CVM
+        with its own attestation.
+      security: [{ containerAuthToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ResumeRequest" }
+      responses:
+        "200":
+          description: New segment id for this CVM.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ResumeResponse" }
+        "400":
+          description: Invalid resume JSON.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: The prior segment could not be adopted (head/id conflict).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
