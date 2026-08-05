@@ -215,12 +215,32 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		body = io.NopCloser(bytes.NewReader(reqBody))
 	}
 
-	// Inherit the inbound request's context so the orchestrator's
-	// cancellation/deadline propagates to the executor — otherwise the
-	// executor keeps churning on a request whose result is already
-	// going to be discarded.
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, executorURL+path, body)
+	requestContext := r.Context()
+	var execReservation *AuditReservation
+	var execID string
+	var err error
+	if path == "/exec" && auditRecorder != nil {
+		execID = randHex(16)
+		var parsed struct {
+			Command string `json:"command"`
+		}
+		_ = json.Unmarshal(reqBody, &parsed)
+		execReservation, err = auditRecorder.Admit(EntryExecIntent, NewSalt(), struct {
+			ID      string `json:"id"`
+			Command string `json:"command"`
+		}{execID, parsed.Command})
+		if err != nil {
+			writeJSONError(w, http.StatusInsufficientStorage, "cannot audit execution: "+err.Error())
+			return
+		}
+		// Once admitted, execution and its completion record must not disappear
+		// merely because the caller disconnects.
+		requestContext = context.WithoutCancel(r.Context())
+	}
+
+	req, err := http.NewRequestWithContext(requestContext, http.MethodPost, executorURL+path, body)
 	if err != nil {
+		recordExecFailure(execReservation, execID, err, time.Duration(0))
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -229,6 +249,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	resp, err := executorClient.Do(req)
 	if err != nil {
+		recordExecFailure(execReservation, execID, err, time.Since(start))
 		writeJSONError(w, http.StatusBadGateway, "executor unavailable: "+err.Error())
 		return
 	}
@@ -248,7 +269,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		if copyErr == nil {
 			_, copyErr = w.Write(respBody)
 		}
-		recordToolCall(path, reqBody, respBody, resp.StatusCode, time.Since(start))
+		recordToolCall(path, reqBody, respBody, resp.StatusCode, time.Since(start), execReservation, execID)
 	} else {
 		// Bulk paths: hash the stream rather than hold it.
 		salt := NewSalt()
@@ -288,7 +309,7 @@ func auditableRequest(path string) bool {
 // are recorded in the clear — they are the action being audited. Outputs are
 // recorded only as salted hashes and lengths: the caller already holds the
 // bytes, so the hash lets them prove an entry matches what they received.
-func recordToolCall(path string, reqBody, respBody []byte, status int, dur time.Duration) {
+func recordToolCall(path string, reqBody, respBody []byte, status int, dur time.Duration, execReservation *AuditReservation, execID string) {
 	if auditRecorder == nil {
 		return
 	}
@@ -296,10 +317,6 @@ func recordToolCall(path string, reqBody, respBody []byte, status int, dur time.
 
 	switch path {
 	case "/exec":
-		var req struct {
-			Command string `json:"command"`
-		}
-		_ = json.Unmarshal(reqBody, &req)
 		var resp struct {
 			Stdout   string `json:"stdout"`
 			Stderr   string `json:"stderr"`
@@ -307,8 +324,8 @@ func recordToolCall(path string, reqBody, respBody []byte, status int, dur time.
 		}
 		parsed := json.Unmarshal(respBody, &resp) == nil
 
-		_, err := auditRecorder.Append(EntryExec, salt, struct {
-			Command    string `json:"command"`
+		body := struct {
+			ID         string `json:"id"`
 			ExitCode   int    `json:"exit_code"`
 			StdoutSHA  string `json:"stdout_sha256"`
 			StdoutLen  int    `json:"stdout_bytes"`
@@ -318,7 +335,7 @@ func recordToolCall(path string, reqBody, respBody []byte, status int, dur time.
 			Parsed     bool   `json:"parsed"`
 			Status     int    `json:"status"`
 		}{
-			Command:    req.Command,
+			ID:         execID,
 			ExitCode:   resp.ExitCode,
 			StdoutSHA:  salt.Hash([]byte(resp.Stdout)),
 			StdoutLen:  len(resp.Stdout),
@@ -327,7 +344,13 @@ func recordToolCall(path string, reqBody, respBody []byte, status int, dur time.
 			DurationMS: dur.Milliseconds(),
 			Parsed:     parsed,
 			Status:     status,
-		})
+		}
+		var err error
+		if execReservation != nil {
+			err = execReservation.Complete(EntryExec, salt, body)
+		} else {
+			_, err = auditRecorder.Append(EntryExec, salt, body)
+		}
 		if err != nil {
 			log.Printf("api-server: audit append failed for /exec: %v", err)
 		}
@@ -366,6 +389,20 @@ func recordToolCall(path string, reqBody, respBody []byte, status int, dur time.
 		if err != nil {
 			log.Printf("api-server: audit append failed for %s: %v", path, err)
 		}
+	}
+}
+
+func recordExecFailure(reservation *AuditReservation, id string, execErr error, dur time.Duration) {
+	if reservation == nil {
+		return
+	}
+	err := reservation.Complete(EntryExec, NewSalt(), struct {
+		ID         string `json:"id"`
+		Error      string `json:"error"`
+		DurationMS int64  `json:"duration_ms"`
+	}{id, execErr.Error(), dur.Milliseconds()})
+	if err != nil {
+		log.Printf("api-server: audit append failed for /exec completion: %v", err)
 	}
 }
 

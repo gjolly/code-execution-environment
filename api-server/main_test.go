@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -141,6 +142,49 @@ func TestProxy_ForwardsStatusAndBody(t *testing.T) {
 	}
 	if got := w.Body.String(); got != `{"forwarded":true}` {
 		t.Errorf("body: got %q, want forwarded body", got)
+	}
+}
+
+func TestProxy_ExecAuditSurvivesCallerCancellation(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer withFakeExecutor(t, func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		io.WriteString(w, `{"stdout":"done","stderr":"","exit_code":0}`)
+	})()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/exec", strings.NewReader(`{"command":"touch /workspace/proof"}`)).WithContext(ctx)
+	req.Header.Set(authTokenHeader, "tok")
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		proxyHandler(w, req)
+		close(done)
+	}()
+
+	<-started
+	cancel()
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("proxy did not finish independently of caller cancellation")
+	}
+
+	lines := auditRecorder.Range(0, 0)
+	if len(lines) != 2 {
+		t.Fatalf("audit entries = %d, want intent and completion", len(lines))
+	}
+	for i, want := range []string{EntryExecIntent, EntryExec} {
+		var entry Entry
+		if err := json.Unmarshal(lines[i], &entry); err != nil {
+			t.Fatal(err)
+		}
+		if entry.Type != want {
+			t.Errorf("entry %d type = %s, want %s", i, entry.Type, want)
+		}
 	}
 }
 

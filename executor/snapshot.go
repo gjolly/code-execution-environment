@@ -147,6 +147,11 @@ func untarInto(root *os.Root, data []byte) error {
 //
 // The snapshotTrailer is declared up-front and only set to "ok" once done
 func handleSnapshot(w http.ResponseWriter, r *http.Request) {
+	// A snapshot is a lifecycle boundary. Wait for the current execution and
+	// its descendant cleanup before capturing the workspace.
+	execMu.Lock()
+	defer execMu.Unlock()
+
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Trailer", snapshotTrailer)
 	w.WriteHeader(http.StatusOK)

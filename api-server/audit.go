@@ -26,19 +26,23 @@ import (
 
 // Entry types.
 const (
-	EntrySessionStart = "session.start"
-	EntrySessionEnd   = "session.end"
-	EntrySessionResum = "session.resume"
-	EntryExec         = "exec"
-	EntryFileRead     = "file.read"
-	EntryFileWrite    = "file.write"
-	EntryUpload       = "upload"
-	EntrySnapshot     = "snapshot"
-	EntryNetRequest   = "net.request"
-	EntryNetDeny      = "net.deny"
-	EntryNetTunnel    = "net.tunnel"
-	EntryPolicyReject = "policy.reject"
-	EntryLogSaturated = "log.saturated"
+	EntrySessionStart     = "session.start"
+	EntrySessionEnd       = "session.end"
+	EntrySessionResum     = "session.resume"
+	EntryExecIntent       = "exec.intent"
+	EntryExec             = "exec"
+	EntryFileRead         = "file.read"
+	EntryFileWrite        = "file.write"
+	EntryUpload           = "upload"
+	EntrySnapshot         = "snapshot"
+	EntryNetConnect       = "net.connect"
+	EntryNetConnectIntent = "net.connect.intent"
+	EntryNetRequestIntent = "net.request.intent"
+	EntryNetRequest       = "net.request"
+	EntryNetDeny          = "net.deny"
+	EntryNetTunnel        = "net.tunnel"
+	EntryPolicyReject     = "policy.reject"
+	EntryLogSaturated     = "log.saturated"
 )
 
 // Saturation caps. The executor is untrusted and could try to bury one real
@@ -68,15 +72,28 @@ type record struct {
 // AuditLog is the in-memory chain. There is no disk: the container is
 // read_only, and the log must never round-trip through the untrusted executor.
 type AuditLog struct {
-	mu         sync.Mutex
-	records    []record
-	head       string
-	bytes      int
-	saturated  bool
-	segmentID  string
-	startedAt  time.Time
-	maxEntries int
-	maxBytes   int
+	mu              sync.Mutex
+	records         []record
+	head            string
+	bytes           int
+	saturated       bool
+	segmentID       string
+	startedAt       time.Time
+	maxEntries      int
+	maxBytes        int
+	reservedEntries int
+	reservedBytes   int
+	sealPending     bool
+}
+
+const reservedCompletionBytes = 16 << 10
+
+// AuditReservation guarantees room for the completion of an action whose
+// admission has already been appended. This prevents concurrent traffic from
+// saturating the log between admission and completion.
+type AuditReservation struct {
+	log  *AuditLog
+	once sync.Once
 }
 
 func NewAuditLog() *AuditLog {
@@ -143,45 +160,120 @@ func (l *AuditLog) Append(typ string, salt Salt, body any) (string, error) {
 	return l.appendLocked(typ, salt, body)
 }
 
+// Admit appends an action before it starts and reserves capacity for its
+// completion. Callers must not perform the action unless Admit succeeds.
+func (l *AuditLog) Admit(typ string, salt Salt, body any) (*AuditReservation, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.saturated {
+		return nil, fmt.Errorf("audit log saturated")
+	}
+	raw, hashValue, err := l.buildLocked(typ, salt, body)
+	if err != nil {
+		return nil, err
+	}
+	if len(l.records)+l.reservedEntries+2 > l.maxEntries ||
+		l.bytes+l.reservedBytes+len(raw)+reservedCompletionBytes > l.maxBytes {
+		l.sealLocked()
+		return nil, fmt.Errorf("audit log has no capacity for action completion")
+	}
+	l.appendRecordLocked(raw, hashValue)
+	l.reservedEntries++
+	l.reservedBytes += reservedCompletionBytes
+	l.updateSaturationLocked()
+	return &AuditReservation{log: l}, nil
+}
+
+// Complete consumes a reservation and appends the terminal action record even
+// when the log stopped accepting new work after admission.
+func (r *AuditReservation) Complete(typ string, salt Salt, body any) error {
+	var completeErr error
+	r.once.Do(func() {
+		l := r.log
+		l.mu.Lock()
+		defer l.mu.Unlock()
+
+		raw, hashValue, err := l.buildLocked(typ, salt, body)
+		if err != nil {
+			completeErr = err
+			raw, hashValue, _ = l.buildLocked(typ, NewSalt(), struct {
+				Error string `json:"audit_error"`
+			}{err.Error()})
+			l.appendRecordLocked(raw, hashValue)
+		} else {
+			l.appendRecordLocked(raw, hashValue)
+		}
+		l.reservedEntries--
+		l.reservedBytes -= reservedCompletionBytes
+		if l.reservedEntries == 0 && (l.sealPending || l.atCapacityLocked()) {
+			l.sealLocked()
+		}
+	})
+	return completeErr
+}
+
 func (l *AuditLog) appendLocked(typ string, salt Salt, body any) (string, error) {
 	if l.saturated {
 		return l.head, fmt.Errorf("audit log saturated")
 	}
-
-	bodyJSON, err := json.Marshal(body)
+	raw, hashValue, err := l.buildLocked(typ, salt, body)
 	if err != nil {
-		return l.head, fmt.Errorf("marshaling %s body: %w", typ, err)
+		return l.head, err
 	}
-
-	e := Entry{
-		Seq:  uint64(len(l.records)),
-		TS:   time.Now().UTC().Format(time.RFC3339Nano),
-		Type: typ,
-		Salt: hex.EncodeToString(salt),
-		Prev: l.head,
-		Body: bodyJSON,
-	}
-	raw, err := json.Marshal(e)
-	if err != nil {
-		return l.head, fmt.Errorf("marshaling %s entry: %w", typ, err)
-	}
-
-	sum := sha256.Sum256(raw)
-	l.records = append(l.records, record{raw: raw, hash: hex.EncodeToString(sum[:])})
-	l.head = hex.EncodeToString(sum[:])
-	l.bytes += len(raw)
-
-	// Seal the chain when it hits a cap, leaving the saturation itself as the
-	// last verifiable link rather than silently dropping records.
-	if !l.saturated && (len(l.records) >= l.maxEntries || l.bytes >= l.maxBytes) {
-		l.sealLocked()
-	}
+	l.appendRecordLocked(raw, hashValue)
+	l.updateSaturationLocked()
 	return l.head, nil
 }
 
-// sealLocked appends the terminal log.saturated entry. Caller holds l.mu and
-// must not have set l.saturated yet.
+func (l *AuditLog) buildLocked(typ string, salt Salt, body any) ([]byte, string, error) {
+	bodyJSON, err := json.Marshal(body)
+	if err != nil {
+		return nil, "", fmt.Errorf("marshaling %s body: %w", typ, err)
+	}
+	e := Entry{
+		Seq: uint64(len(l.records)), TS: time.Now().UTC().Format(time.RFC3339Nano),
+		Type: typ, Salt: hex.EncodeToString(salt), Prev: l.head, Body: bodyJSON,
+	}
+	raw, err := json.Marshal(e)
+	if err != nil {
+		return nil, "", fmt.Errorf("marshaling %s entry: %w", typ, err)
+	}
+	sum := sha256.Sum256(raw)
+	return raw, hex.EncodeToString(sum[:]), nil
+}
+
+func (l *AuditLog) appendRecordLocked(raw []byte, hashValue string) {
+	l.records = append(l.records, record{raw: raw, hash: hashValue})
+	l.head = hashValue
+	l.bytes += len(raw)
+}
+
+func (l *AuditLog) atCapacityLocked() bool {
+	return len(l.records)+l.reservedEntries >= l.maxEntries ||
+		l.bytes+l.reservedBytes >= l.maxBytes
+}
+
+func (l *AuditLog) updateSaturationLocked() {
+	if !l.atCapacityLocked() {
+		return
+	}
+	l.saturated = true
+	if l.reservedEntries > 0 {
+		l.sealPending = true
+		return
+	}
+	l.sealLocked()
+}
+
+// sealLocked appends the terminal log.saturated entry. Caller holds l.mu.
+// Sealing waits behind admitted actions so their completions remain in-chain.
 func (l *AuditLog) sealLocked() {
+	if l.reservedEntries > 0 {
+		l.saturated = true
+		l.sealPending = true
+		return
+	}
 	body, _ := json.Marshal(struct {
 		AfterSeq uint64 `json:"after_seq"`
 		Entries  int    `json:"entries"`
@@ -213,6 +305,7 @@ func (l *AuditLog) sealLocked() {
 	l.head = hex.EncodeToString(sum[:])
 	l.bytes += len(raw)
 	l.saturated = true
+	l.sealPending = false
 }
 
 // Saturated reports whether the log has stopped accepting entries. Egress

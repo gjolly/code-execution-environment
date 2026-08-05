@@ -156,14 +156,34 @@ func (p *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
+	mode := "mitm"
+	if tunnel {
+		mode = "tunnel"
+	}
+	id := randHex(16)
+	reservation, err := p.audit.Admit(EntryNetConnectIntent, NewSalt(), struct {
+		ID   string `json:"id"`
+		Host string `json:"host"`
+		Port string `json:"port"`
+		Mode string `json:"mode"`
+	}{id, host, port, mode})
+	if err != nil {
+		http.Error(w, "cannot audit connection", http.StatusInsufficientStorage)
+		return
+	}
+	result := &connectResult{id: id, mode: mode, outcome: "closed", startedAt: time.Now()}
+	defer p.completeConnect(reservation, result)
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
+		result.outcome = "hijack-unavailable"
 		http.Error(w, "cannot hijack connection", http.StatusInternalServerError)
 		return
 	}
 	client, _, err := hj.Hijack()
 	if err != nil {
+		result.outcome = "hijack-failed"
+		result.err = err.Error()
 		http.Error(w, "hijack failed", http.StatusInternalServerError)
 		return
 	}
@@ -171,6 +191,8 @@ func (p *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	upstream, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), originDialTimeout)
 	if err != nil {
+		result.outcome = "dial-failed"
+		result.err = err.Error()
 		fmt.Fprintf(client, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
 		p.refuse("https://"+host+"/", http.MethodConnect, "upstream", "dial failed: "+err.Error())
 		return
@@ -178,14 +200,40 @@ func (p *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	defer upstream.Close()
 
 	if _, err := io.WriteString(client, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		result.outcome = "client-write-failed"
+		result.err = err.Error()
 		return
 	}
 
 	if tunnel {
-		p.tunnel(client, upstream, host, port)
+		p.tunnel(client, upstream, result)
 		return
 	}
-	p.intercept(client, upstream, host, port)
+	p.intercept(client, upstream, host, port, result)
+}
+
+type connectResult struct {
+	id, mode, outcome, err string
+	bytesUp, bytesDown     int64
+	startedAt              time.Time
+}
+
+func (p *EgressProxy) completeConnect(reservation *AuditReservation, result *connectResult) {
+	typ := EntryNetConnect
+	if result.mode == "tunnel" {
+		typ = EntryNetTunnel
+	}
+	if err := reservation.Complete(typ, NewSalt(), struct {
+		ID         string `json:"id"`
+		BytesUp    int64  `json:"bytes_up"`
+		BytesDown  int64  `json:"bytes_down"`
+		Outcome    string `json:"outcome"`
+		Error      string `json:"error,omitempty"`
+		Mode       string `json:"mode"`
+		DurationMS int64  `json:"duration_ms"`
+	}{result.id, result.bytesUp, result.bytesDown, result.outcome, result.err, result.mode, time.Since(result.startedAt).Milliseconds()}); err != nil {
+		log.Printf("api-server: audit append failed for connection completion: %v", err)
+	}
 }
 
 // tunnel copies bytes opaquely for hosts the policy marks tunnel-only.
@@ -193,46 +241,33 @@ func (p *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 // The record is necessarily thin: the CONNECT target, the ClientHello SNI, and
 // byte counts. There is no method, URL, or origin certificate hash — TLS 1.3
 // encrypts the Certificate message, so a passthrough proxy cannot observe it.
-func (p *EgressProxy) tunnel(client, upstream net.Conn, host, port string) {
-	start := time.Now()
-	var up, down int64
-
+func (p *EgressProxy) tunnel(client, upstream net.Conn, result *connectResult) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		up, _ = io.Copy(upstream, client)
+		result.bytesUp, _ = io.Copy(upstream, client)
 		if c, ok := upstream.(*net.TCPConn); ok {
 			c.CloseWrite()
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		down, _ = io.Copy(client, upstream)
+		result.bytesDown, _ = io.Copy(client, upstream)
 		if c, ok := client.(*net.TCPConn); ok {
 			c.CloseWrite()
 		}
 	}()
 	wg.Wait()
-
-	salt := NewSalt()
-	if _, err := p.audit.Append(EntryNetTunnel, salt, struct {
-		Host       string `json:"host"`
-		Port       string `json:"port"`
-		BytesUp    int64  `json:"bytes_up"`
-		BytesDown  int64  `json:"bytes_down"`
-		DurationMS int64  `json:"duration_ms"`
-		Mode       string `json:"mode"`
-	}{host, port, up, down, time.Since(start).Milliseconds(), "tunnel"}); err != nil {
-		log.Printf("api-server: audit append failed for tunnel to %s: %v", host, err)
-	}
 }
 
 // intercept terminates TLS under a minted leaf and forwards each request,
 // verifying the origin normally on the upstream leg.
-func (p *EgressProxy) intercept(client, upstream net.Conn, host, port string) {
+func (p *EgressProxy) intercept(client, upstream net.Conn, host, port string, result *connectResult) {
 	leaf, err := p.ca.LeafFor(host)
 	if err != nil {
+		result.outcome = "leaf-failed"
+		result.err = err.Error()
 		log.Printf("api-server: minting leaf for %s: %v", host, err)
 		return
 	}
@@ -242,6 +277,8 @@ func (p *EgressProxy) intercept(client, upstream net.Conn, host, port string) {
 		MinVersion:   tls.VersionTLS12,
 	})
 	if err := clientTLS.Handshake(); err != nil {
+		result.outcome = "client-tls-failed"
+		result.err = err.Error()
 		// Commonly a cert-pinning client. Record it: a pinned client failing
 		// is a policy-relevant event, not noise.
 		p.refuse("https://"+host+"/", http.MethodConnect, "mitm", "client rejected interception: "+err.Error())
@@ -256,6 +293,8 @@ func (p *EgressProxy) intercept(client, upstream net.Conn, host, port string) {
 	hsCtx, cancel := context.WithTimeout(context.Background(), originTLSTimeout)
 	defer cancel()
 	if err := originTLS.HandshakeContext(hsCtx); err != nil {
+		result.outcome = "origin-tls-failed"
+		result.err = err.Error()
 		p.refuse("https://"+host+"/", http.MethodConnect, "upstream", "origin TLS failed: "+err.Error())
 		return
 	}
@@ -321,8 +360,24 @@ func (p *EgressProxy) forward(
 	req.Header.Del("Proxy-Authorization")
 
 	names, values := recordHeaders(req.Header, salt)
+	id := randHex(16)
+	reservation, err := p.audit.Admit(EntryNetRequestIntent, salt, struct {
+		ID           string            `json:"id"`
+		Method       string            `json:"method"`
+		URL          string            `json:"url"`
+		Host         string            `json:"host"`
+		ReqHeaders   []string          `json:"req_headers"`
+		ReqHdrValues map[string]string `json:"req_header_values"`
+		Decision     string            `json:"decision"`
+		Mode         string            `json:"mode"`
+	}{id, req.Method, rawurl, req.Host, names, values, "allow", "mitm"})
+	if err != nil {
+		writeSimpleResponse(client, http.StatusInsufficientStorage, "cannot audit request")
+		return err
+	}
 
 	if err := req.Write(origin); err != nil {
+		p.completeRequestError(reservation, id, err, time.Since(start), "mitm")
 		p.refuse(rawurl, req.Method, "upstream", "write failed: "+err.Error())
 		writeSimpleResponse(client, http.StatusBadGateway, "upstream write failed")
 		return err
@@ -330,6 +385,7 @@ func (p *EgressProxy) forward(
 
 	resp, err := http.ReadResponse(originReader, req)
 	if err != nil {
+		p.completeRequestError(reservation, id, err, time.Since(start), "mitm")
 		p.refuse(rawurl, req.Method, "upstream", "read failed: "+err.Error())
 		writeSimpleResponse(client, http.StatusBadGateway, "upstream read failed")
 		return err
@@ -354,7 +410,8 @@ func (p *EgressProxy) forward(
 		truncated = true
 	}
 
-	if _, err := p.audit.Append(EntryNetRequest, salt, struct {
+	if err := reservation.Complete(EntryNetRequest, salt, struct {
+		ID           string            `json:"id"`
 		Method       string            `json:"method"`
 		URL          string            `json:"url"`
 		Host         string            `json:"host"`
@@ -371,6 +428,7 @@ func (p *EgressProxy) forward(
 		Decision     string            `json:"decision"`
 		Mode         string            `json:"mode"`
 	}{
+		ID:           id,
 		Method:       req.Method,
 		URL:          rawurl,
 		Host:         req.Host,
@@ -420,9 +478,25 @@ func (p *EgressProxy) handlePlain(w http.ResponseWriter, r *http.Request) {
 	outReq.Header.Del("Proxy-Authorization")
 
 	names, values := recordHeaders(r.Header, salt)
+	id := randHex(16)
+	reservation, err := p.audit.Admit(EntryNetRequestIntent, salt, struct {
+		ID           string            `json:"id"`
+		Method       string            `json:"method"`
+		URL          string            `json:"url"`
+		Host         string            `json:"host"`
+		ReqHeaders   []string          `json:"req_headers"`
+		ReqHdrValues map[string]string `json:"req_header_values"`
+		Decision     string            `json:"decision"`
+		Mode         string            `json:"mode"`
+	}{id, r.Method, rawurl, r.Host, names, values, "allow", "plaintext"})
+	if err != nil {
+		http.Error(w, "cannot audit request", http.StatusInsufficientStorage)
+		return
+	}
 
 	resp, err := plainTransport.RoundTrip(outReq)
 	if err != nil {
+		p.completeRequestError(reservation, id, err, time.Since(start), "plaintext")
 		p.refuse(rawurl, r.Method, "upstream", err.Error())
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 		return
@@ -439,7 +513,8 @@ func (p *EgressProxy) handlePlain(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, io.TeeReader(io.LimitReader(resp.Body, maxResp), respHash))
 
-	if _, err := p.audit.Append(EntryNetRequest, salt, struct {
+	if err := reservation.Complete(EntryNetRequest, salt, struct {
+		ID           string            `json:"id"`
 		Method       string            `json:"method"`
 		URL          string            `json:"url"`
 		Host         string            `json:"host"`
@@ -456,6 +531,7 @@ func (p *EgressProxy) handlePlain(w http.ResponseWriter, r *http.Request) {
 		Decision     string            `json:"decision"`
 		Mode         string            `json:"mode"`
 	}{
+		ID:           id,
 		Method:       r.Method,
 		URL:          rawurl,
 		Host:         r.Host,
@@ -476,7 +552,18 @@ func (p *EgressProxy) handlePlain(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-var plainTransport = &http.Transport{
+func (p *EgressProxy) completeRequestError(reservation *AuditReservation, id string, requestErr error, dur time.Duration, mode string) {
+	if err := reservation.Complete(EntryNetRequest, NewSalt(), struct {
+		ID         string `json:"id"`
+		Error      string `json:"error"`
+		DurationMS int64  `json:"duration_ms"`
+		Mode       string `json:"mode"`
+	}{id, requestErr.Error(), dur.Milliseconds(), mode}); err != nil {
+		log.Printf("api-server: audit append failed for request completion: %v", err)
+	}
+}
+
+var plainTransport http.RoundTripper = &http.Transport{
 	DialContext:           (&net.Dialer{Timeout: originDialTimeout}).DialContext,
 	ResponseHeaderTimeout: 60 * time.Second,
 }

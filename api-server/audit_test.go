@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -125,6 +126,41 @@ func TestAudit_SaturationSealsAndRefuses(t *testing.T) {
 	if got := replay(t, lines); got == "" {
 		t.Error("sealed chain does not replay")
 	}
+}
+
+func TestAudit_ReservationCompletesAfterSaturation(t *testing.T) {
+	l := NewAuditLog()
+	l.maxEntries = 3
+
+	reservation, err := l.Admit(EntryNetRequestIntent, NewSalt(), map[string]any{"id": "request-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Append(EntryExec, NewSalt(), map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	if !l.Saturated() {
+		t.Fatal("reserved completion must count toward saturation")
+	}
+	if err := reservation.Complete(EntryNetRequest, NewSalt(), map[string]any{"id": "request-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	lines := l.Range(0, 0)
+	if len(lines) != 4 {
+		t.Fatalf("entries = %d, want admission, concurrent entry, completion, and seal", len(lines))
+	}
+	want := []string{EntryNetRequestIntent, EntryExec, EntryNetRequest, EntryLogSaturated}
+	for i, raw := range lines {
+		var entry Entry
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			t.Fatal(err)
+		}
+		if entry.Type != want[i] {
+			t.Errorf("entry %d type = %s, want %s", i, entry.Type, want[i])
+		}
+	}
+	replay(t, lines)
 }
 
 func TestAudit_SaltedHashIsDeterministicAndSalted(t *testing.T) {
@@ -277,6 +313,74 @@ func TestEgressProxy_RefusesWhenAuditSaturated(t *testing.T) {
 
 	if w.Code != http.StatusForbidden {
 		t.Errorf("status %d, want 403 once the log can no longer record", w.Code)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestEgressProxy_RecordsAdmissionBeforeRoundTrip(t *testing.T) {
+	audit := NewAuditLog()
+	p := NewEgressProxy(audit, mustCA(t))
+	eff, _ := Compose([]string{"example.com"}, &Policy{Allow: []string{"example.com"}})
+	p.SetPolicy(eff)
+
+	oldTransport := plainTransport
+	defer func() { plainTransport = oldTransport }()
+	plainTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		lines := audit.Range(0, 0)
+		if len(lines) != 1 {
+			t.Fatalf("entries before outbound round trip = %d, want 1 admission", len(lines))
+		}
+		var entry Entry
+		json.Unmarshal(lines[0], &entry)
+		if entry.Type != EntryNetRequestIntent {
+			t.Fatalf("first entry type = %s, want %s", entry.Type, EntryNetRequestIntent)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("ok")),
+		}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/resource", nil)
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	lines := audit.Range(0, 0)
+	if len(lines) != 2 {
+		t.Fatalf("entries after round trip = %d, want admission and completion", len(lines))
+	}
+	var completion Entry
+	json.Unmarshal(lines[1], &completion)
+	if completion.Type != EntryNetRequest {
+		t.Errorf("completion type = %s, want %s", completion.Type, EntryNetRequest)
+	}
+}
+
+func TestEgressProxy_ConnectAdmissionPrecedesHijack(t *testing.T) {
+	audit := NewAuditLog()
+	p := NewEgressProxy(audit, mustCA(t))
+	eff, _ := Compose([]string{"example.com"}, &Policy{Allow: []string{"example.com"}, TunnelOnly: []string{"example.com"}})
+	p.SetPolicy(eff)
+
+	req := httptest.NewRequest(http.MethodConnect, "https://example.com", nil)
+	req.Host = "example.com:443"
+	w := httptest.NewRecorder() // Deliberately not an http.Hijacker.
+	p.ServeHTTP(w, req)
+
+	lines := audit.Range(0, 0)
+	if len(lines) != 2 {
+		t.Fatalf("entries = %d, want connection admission and completion", len(lines))
+	}
+	var first Entry
+	json.Unmarshal(lines[0], &first)
+	if first.Type != EntryNetConnectIntent {
+		t.Errorf("first entry type = %s, want %s", first.Type, EntryNetConnectIntent)
 	}
 }
 

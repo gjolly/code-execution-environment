@@ -1,18 +1,20 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -97,11 +99,39 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
 
-	var stdoutBuf, stderrBuf bytes.Buffer
-	cmd.Stdout = &stdoutBuf
-	cmd.Stderr = &stderrBuf
+	stdoutFile, err := os.CreateTemp("/tmp", "exec-stdout-*")
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "creating stdout capture: "+err.Error())
+		return
+	}
+	defer stdoutFile.Close()
+	_ = os.Remove(stdoutFile.Name())
+	stderrFile, err := os.CreateTemp("/tmp", "exec-stderr-*")
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "creating stderr capture: "+err.Error())
+		return
+	}
+	defer stderrFile.Close()
+	_ = os.Remove(stderrFile.Name())
+	cmd.Stdout = stdoutFile
+	cmd.Stderr = stderrFile
 
-	err := cmd.Run()
+	err = cmd.Run()
+	// Process-group cancellation is insufficient: setsid(2) lets descendants
+	// escape it. All user commands run under an otherwise-unused UID, so killing
+	// that UID after every execution provides a lifecycle boundary for detached
+	// descendants too.
+	if cleanupErr := killCommandProcesses(); cleanupErr != nil {
+		// Exiting the container is the only safe fallback: the runtime tears down
+		// its PID namespace, so cleanup can never fail open.
+		log.Fatalf("executor: command descendant cleanup failed: %v", cleanupErr)
+	}
+	stdout, stdoutErr := readCapture(stdoutFile)
+	stderr, stderrErr := readCapture(stderrFile)
+	if stdoutErr != nil || stderrErr != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("reading command output: stdout=%v stderr=%v", stdoutErr, stderrErr))
+		return
+	}
 
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		respondJSON(w, http.StatusOK, execResponse{
@@ -123,10 +153,77 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondJSON(w, http.StatusOK, execResponse{
-		Stdout:   stdoutBuf.String(),
-		Stderr:   stderrBuf.String(),
+		Stdout:   string(stdout),
+		Stderr:   string(stderr),
 		ExitCode: exitCode,
 	})
+}
+
+func readCapture(f *os.File) ([]byte, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return io.ReadAll(f)
+}
+
+func killCommandProcesses() error {
+	deadline := time.Now().Add(time.Second)
+	cleanScans := 0
+	for time.Now().Before(deadline) {
+		pids, err := commandPIDs()
+		if err != nil {
+			return err
+		}
+		if len(pids) == 0 {
+			cleanScans++
+			if cleanScans == 2 {
+				return nil
+			}
+		} else {
+			cleanScans = 0
+			for _, pid := range pids {
+				if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+					return fmt.Errorf("killing pid %d: %w", pid, err)
+				}
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return errors.New("command processes remained after SIGKILL")
+}
+
+func commandPIDs() ([]int, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, err
+	}
+	var pids []int
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		status, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "status"))
+		if err != nil {
+			continue
+		}
+		uidMatch := false
+		zombie := false
+		for _, line := range strings.Split(string(status), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 && fields[0] == "Uid:" {
+				uid, parseErr := strconv.ParseUint(fields[1], 10, 32)
+				uidMatch = parseErr == nil && uid == bashUID
+			}
+			if len(fields) >= 2 && fields[0] == "State:" {
+				zombie = fields[1] == "Z"
+			}
+		}
+		if uidMatch && !zombie {
+			pids = append(pids, pid)
+		}
+	}
+	return pids, nil
 }
 
 func handleRead(w http.ResponseWriter, r *http.Request) {
